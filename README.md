@@ -184,7 +184,13 @@ HighlightProcessorStack.ClusterName = HighlightProcessorCluster
 
 ## How to Use
 
-### Step 1: Get the S3 Bucket Name
+You can interact with the highlight reel generator in two ways: through the command line for direct AWS interaction, or by using the local Streamlit UI for a user-friendly experience.
+
+### Option 1: Using the AWS CLI
+
+This method is suitable for developers and users comfortable with the AWS Command Line Interface.
+
+**Step 1: Get the S3 Bucket Name**
 
 After a successful deployment, the CDK outputs the name of the S3 bucket created for video uploads. You can retrieve this bucket name from the CloudFormation stack outputs.
 
@@ -199,7 +205,7 @@ echo $BUCKET_NAME
 This will return the bucket name, which will look something like this:
 `video-uploads--us-east-1-highlightprocessorstack`
 
-### Step 2: Upload a Video
+**Step 2: Upload a Video**
 
 Upload your video file to the `videos/` prefix in the S3 bucket.
 
@@ -210,7 +216,7 @@ aws s3 cp your-video.mp4 s3://$BUCKET_NAME/videos/
 
 The pipeline supports any video format compatible with FFmpeg, such as MP4, MOV, and AVI.
 
-### Step 3: Monitor the Pipeline
+**Step 3: Monitor the Pipeline**
 
 The pipeline is triggered automatically when a new video is uploaded to the S3 bucket. You can monitor the two main stages of the pipeline through CloudWatch Logs:
 
@@ -259,7 +265,7 @@ The pipeline is triggered automatically when a new video is uploaded to the S3 b
 
 
 
-### Step 4: Download the Highlight Reel
+**Step 4: Download the Highlight Reel**
 
 Once the processing is complete, the final highlight reel will be available in the `results/` prefix of your S3 bucket.
 
@@ -270,6 +276,63 @@ aws s3 ls s3://$BUCKET_NAME/results/
 # Download the highlight reel
 aws s3 cp s3://$BUCKET_NAME/results/your-video_highlights.mp4 ./
 ```
+
+### Option 2: Using the Frontend UI
+
+The Streamlit UI provides a graphical interface to upload videos, track processing, and download results without needing to use the AWS CLI for every step.
+
+**Step 1: Setup and Run the UI**
+
+Before using the UI, you need to install its dependencies and run the Streamlit app.
+
+```bash
+# Navigate to the frontend directory
+cd frontend/
+
+# Create a Python virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Run the Streamlit app
+streamlit run ui/app.py
+```
+
+This will open the application in your web browser.
+
+**Step 2: Configure Settings**
+
+1.  Open the sidebar in the Streamlit app.
+2.  Enter your **S3 Bucket**, **AWS Region**, and the **Stack name** (default is `HighlightProcessorStack`).
+3.  If you don't know the bucket name, the app can try to discover it from your CloudFormation stack outputs.
+4.  Click **"Save settings"** to store your configuration for future use.
+
+**Step 3: Upload and Process a Video**
+
+You have several options for uploading your video file:
+
+  * **Quick upload:** Drag and drop a smaller video directly into the browser.
+  * **Large upload (recommended for big files):**
+      * **Local file path:** Provide the absolute path to a video on your computer. The app will handle the upload efficiently using multipart uploading.
+      * **Existing S3 object:** Provide the `s3://bucket/key` URI of a video already in S3 to copy it to the correct input location without re-uploading.
+
+After selecting your video, you can optionally customize the prompt used for event detection. Click **"Start upload & process"** to begin.
+
+**Step 4: Monitor and Download**
+
+The UI will display the progress of the upload and the subsequent processing stages by monitoring CloudWatch logs in real-time:
+
+  - Lambda trigger received
+  - ECS task started
+  - Stage 1: Downsampling
+  - Stage 2: Inference
+  - Stage 3: Clipping & Merging
+  - Finished successfully
+
+Once complete, a preview of the highlight reel will appear. You can then download the final video directly from the UI.
+
 
 ### Custom Configuration with `config.yaml`
 
