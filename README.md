@@ -1,16 +1,17 @@
 # Automatic Highlight Reel Generator
 
-| Index | Description |
-|:----------------|:-----------|
-| [Overview](#overview) | See the motivation behind this project. |
-| [Description](#description) | Learn more about the problem, the implemented solution, and the technologies used. |
-| [Deployment Guide](#deployment) | How to install and deploy the highlight generator. |
-| [How to Use](#how-to-use) | Instructions to use the highlight generator. |
-| [Algorithm](#algorithm) | An explanation of the three-stage video processing pipeline. |
-| [Lessons Learned](#lessons-learned) | Limitations and lessons learned. |
-| [Performance and Cost](#performance-and-cost) | A guide to performance and costs for different instances. |
-| [Credits](#credits) | Meet the team behind this project. |
-| [License](#license) | License details. |
+| Index                                         | Description                                                                        |
+|:----------------------------------------------|:-----------------------------------------------------------------------------------|
+| [Overview](#overview)                         | See the motivation behind this project.                                            |
+| [Description](#description)                   | Learn more about the problem, the implemented solution, and the technologies used. |
+| [Deployment Guide](#deployment)               | How to install and deploy the highlight generator.                                 |
+| [How to Use](#how-to-use)                     | Instructions to use the highlight generator.                                       |
+| [Algorithm](#algorithm)                       | An explanation of the three-stage video processing pipeline.                       |
+| [Lessons Learned](#lessons-learned)           | Limitations and lessons learned.                                                   |
+| [Performance and Cost](#performance-and-cost) | A guide to performance and costs for different instances.                          |
+| [Credits](#credits)                           | Meet the team behind this project.                                                 |
+| [License](#license)                           | License details.                                                                   |
+| [Disclaimers](#Disclaimers)                   | Disclaimers information.                                                           
 
 ---
 
@@ -473,6 +474,47 @@ This project is designed and developed with guidance and support from the **Univ
 
 ## License
 
-> To be updated
 
-This project will be distributed under an open-source license.
+This project is distributed under the [MIT License](LICENSE).
+
+```
+MIT License
+
+Copyright (c) 2025 University of Pittsburgh Health Sciences and Sports Analytics Cloud Innovation Center
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+
+## Disclaimers
+
+**Customers are responsible for making their own independent assessment of the information in this document.** 
+
+**This document:**  
+(a) is for informational purposes only,  
+(b) references AWS product offerings and practices, which are subject to change without notice,  
+(c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. The responsibilities and liabilities of AWS to its customers are controlled by AWS agreements, and this document is not part of, nor does it modify, any agreement between AWS and its customers, and  
+(d) is not to be considered a recommendation or viewpoint of AWS.   
+
+**Additionally, you are solely responsible for testing, security and optimizing all code and assets on GitHub repo, and all such code and assets should be considered:**  
+(a) as-is and without warranties or representations of any kind,  
+(b) not suitable for production environments, or on production or other critical data, and  
+(c) to include shortcuts in order to support rapid prototyping such as, but not limited to, relaxed authentication and authorization and a lack of strict adherence to security best practices.     
+
+**All work produced is open source. More information can be found in the GitHub repo.**
