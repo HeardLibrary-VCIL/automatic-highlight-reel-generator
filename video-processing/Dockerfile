@@ -1,41 +1,25 @@
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+# Slim CPU image for head/tail dead-space trimming.
+# Uses ffmpeg (black/freeze/silence) + opencv (bars/snow) + boto3 (S3 I/O).
+# No GPU, PyTorch, transformers, or PaliGemma -- that was the old diving pipeline.
+# (Recover the old GPU Dockerfile from git history if the VLM path is needed again.)
+FROM python:3.10-slim
 
-# Set non-interactive frontend for package installers
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install essential system dependencies including FFmpeg and Python
+# ffmpeg powers the detectors + the trim. libglib2.0-0 is a runtime dep of
+# opencv-python-headless. Kept intentionally minimal.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    python3.10 \
-    python3-pip \
+    libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Make python3.10 the default python3
-RUN ln -sf /usr/bin/python3.10 /usr/bin/python3
-
-# Set the working directory
 WORKDIR /app
 
-# Copy requirements file and install Python dependencies
-COPY requirements.txt .
-# Install PyTorch with CUDA 12.1 support
-RUN pip3 install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+COPY requirements-trim.txt .
+RUN pip3 install --no-cache-dir -r requirements-trim.txt
 
-# Install the remaining Python packages
-RUN pip3 install --no-cache-dir -r requirements.txt
-
-# Set a predictable cache directory for Hugging Face models
-ENV HUGGINGFACE_HUB_CACHE=/app/hf_cache
-
-# "Bake" the Pali-Gemma model into the image to avoid downloading it at runtime.
-# A Hugging Face token must be passed as a build argument.
-# The Hugging Face token is passed as an environment variable from the ECS task definition.
-ARG HUGGINGFACE_TOKEN
-RUN huggingface-cli login --token ${HUGGINGFACE_TOKEN} && huggingface-cli download google/paligemma2-3b-mix-224
-
-# Copy all application code and config files into the container
+# Copy application code (see .dockerignore for what's excluded).
 COPY . /app/
 
-# Set the default command to run when the container starts.
-# This runs the main orchestrator script.
+# The ECS task overrides env (S3_BUCKET, S3_KEY) and runs this.
 CMD ["python3", "main.py"]

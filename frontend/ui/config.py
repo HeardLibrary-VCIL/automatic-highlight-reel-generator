@@ -17,7 +17,7 @@ import boto3
 STACK_NAME = os.getenv("STACK_NAME", "HighlightProcessorStack")
 INPUT_PREFIX = os.getenv("INPUT_PREFIX", "videos/")
 RESULT_PREFIX = os.getenv("RESULT_PREFIX", "results/")
-RESULT_NAMING = os.getenv("RESULT_NAMING", "{basename}_highlights.mp4")
+RESULT_NAMING = os.getenv("RESULT_NAMING", "{basename}_trimmed.mp4")
 CUSTOM_PROMPT_KEY = os.getenv("CUSTOM_PROMPT_KEY", "prompt")
 DEFAULT_PROMPT = os.getenv(
     "DEFAULT_PROMPT", "<image> Is there a person in the air jumping into the water? Answer with 'yes' or 'no'.\n"

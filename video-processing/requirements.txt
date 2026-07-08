@@ -28,7 +28,7 @@ s3transfer==0.13.1
 safetensors==0.5.3
 sentencepiece==0.2.0
 six==1.17.0
-sympy==1.13.1
+sympy>=1.13.3
 tokenizers==0.21.2
 tqdm==4.67.1
 transformers==4.53.3

@@ -1,0 +1,10 @@
+# Keep the Docker build context small — none of this belongs in the image.
+.venv/
+output/
+test_videos/
+sample_work/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+hf_cache/

@@ -49,8 +49,6 @@ READMEDRAFT.md
 
 *.patch
 
-.dockerignore
-
 /aws/
 
 # ----------------------------
@@ -59,6 +57,8 @@ READMEDRAFT.md
 venv/
 env/
 ENV/
+__pycache__/
+*.pyc
 
 # ----------------------------
 # Project-specific ignores
@@ -77,5 +77,10 @@ model-testing/.cache/**
 model-testing/test_frames/**
 model-testing/test_frames.tar.gz
 
+# Video-processing generated outputs (large / regenerable)
+/video-processing/output/
+/video-processing/sample_work/
+/video-processing/test_videos/
+
 # Copilot context
-/prompts/ 
+/prompts/

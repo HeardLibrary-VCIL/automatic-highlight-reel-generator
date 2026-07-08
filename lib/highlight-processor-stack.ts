@@ -125,7 +125,9 @@ export class HighlightProcessorStack extends cdk.Stack {
 
     // Create S3 Bucket
     const videoBucket = new s3.Bucket(this, 'VideoBucket', {
-      bucketName: `video-uploads-${this.account}-${this.region}-${this.stackName}`.toLowerCase(),
+      // Only stackName can contain uppercase; lowercasing the whole string would
+      // mangle the unresolved account/region tokens and break synth without creds.
+      bucketName: `video-uploads-${this.account}-${this.region}-${this.stackName.toLowerCase()}`,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
     });

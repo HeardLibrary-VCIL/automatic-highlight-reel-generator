@@ -16,9 +16,32 @@ log = logging.getLogger(__name__)
 
 # --- Environment and Device Setup ---
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
-torch.cuda.empty_cache()
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-log.info(f"Using device: {device}")
+
+
+def _select_device_and_dtype():
+    """Picks the best available torch device and a safe dtype for it.
+
+    Order of preference: CUDA (fp16) -> Apple Silicon MPS (fp16) -> CPU (fp32).
+    Set the PALIGEMMA_DTYPE env var (e.g. "float32") to override the dtype,
+    for example if MPS fp16 produces NaNs / no detections.
+    """
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        device, dtype = torch.device("cuda"), torch.float16
+    elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+        # fp16 keeps the 3B model around ~6GB of unified memory; fp32 is ~12GB.
+        device, dtype = torch.device("mps"), torch.float16
+    else:
+        device, dtype = torch.device("cpu"), torch.float32
+
+    override = os.environ.get("PALIGEMMA_DTYPE")
+    if override:
+        dtype = getattr(torch, override)
+    return device, dtype
+
+
+device, model_dtype = _select_device_and_dtype()
+log.info(f"Using device: {device} (dtype: {model_dtype})")
 
 
 # --- Model Loading ---
@@ -29,7 +52,7 @@ def load_model(model_id: str):
     processor = AutoProcessor.from_pretrained(model_id)
     model = PaliGemmaForConditionalGeneration.from_pretrained(
         model_id,
-        torch_dtype=torch.float16,
+        torch_dtype=model_dtype,
         low_cpu_mem_usage=True,
     ).to(device)
     model.eval()
