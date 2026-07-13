@@ -64,6 +64,68 @@ def validate_video_file(bucket, key):
     except Exception as e:
         return False, f"Error validating file: {str(e)}", None
 
+def launch_trim_task(bucket, trim_request_key):
+    """Launch an ECS task in TRIM mode using the trim request JSON."""
+    try:
+        # Read the trim request to get the video key
+        response = s3.get_object(Bucket=bucket, Key=trim_request_key)
+        trim_data = json.loads(response['Body'].read().decode('utf-8'))
+        video_key = trim_data.get('video_key', '')
+        
+        if not video_key:
+            logger.error(f"Trim request missing video_key: {trim_request_key}")
+            return {'key': trim_request_key, 'reason': 'Missing video_key'}
+
+        # Get environment variables
+        cluster = os.environ['CLUSTER_NAME']
+        task_definition = os.environ['TASK_DEFINITION']
+        subnet_ids = os.environ['SUBNET_IDS'].split(',')
+        security_group = os.environ['SECURITY_GROUP']
+        assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
+        capacity_provider_name = os.environ['CAPACITY_PROVIDER_NAME']
+
+        # Start ECS task in TRIM mode
+        response = ecs.run_task(
+            cluster=cluster,
+            capacityProviderStrategy=[
+                {'capacityProvider': capacity_provider_name, 'weight': 1},
+            ],
+            taskDefinition=task_definition,
+            count=1,
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': subnet_ids,
+                    'assignPublicIp': assign_public_ip,
+                    'securityGroups': [security_group]
+                }
+            },
+            overrides={
+                'containerOverrides': [{
+                    'name': 'video-processor',
+                    'environment': [
+                        {'name': 'S3_BUCKET', 'value': bucket},
+                        {'name': 'S3_KEY', 'value': video_key},
+                        {'name': 'TRIM_REQUEST_KEY', 'value': trim_request_key},
+                        {'name': 'MODE', 'value': 'trim'},
+                    ]
+                }]
+            }
+        )
+
+        if response.get('failures'):
+            failure = response['failures'][0]
+            logger.error(f"ECS trim task failed: {failure.get('reason')}")
+            return {'key': trim_request_key, 'reason': f"ECS failed: {failure.get('reason')}"}
+
+        task_arn = response['tasks'][0]['taskArn']
+        logger.info(f"Started ECS trim task: {task_arn}")
+        return {'key': trim_request_key, 'task_arn': task_arn, 'mode': 'trim'}
+
+    except Exception as e:
+        logger.error(f"Error launching trim task: {e}")
+        return {'key': trim_request_key, 'reason': str(e)}
+
+
 def lambda_handler(event, context):
     """
     Lambda function triggered by S3 uploads to start ECS video processing task
@@ -83,6 +145,18 @@ def lambda_handler(event, context):
             key = unquote_plus(record['s3']['object']['key'])
             
             logger.info(f"Processing file: s3://{bucket}/{key}")
+            
+            # Route: edit/*_trim_request.json → trim mode
+            if key.startswith('edit/') and key.endswith('_trim_request.json'):
+                logger.info(f"Trim request detected: {key}")
+                processed_files.append(launch_trim_task(bucket, key))
+                continue
+            
+            # Route: video/*.mp4 → segment detection mode
+            if not key.startswith('video/'):
+                logger.info(f"Skipping {key}: not in video/ or edit/ prefix")
+                skipped_files.append({'key': key, 'reason': 'Not in video/ or edit/ prefix'})
+                continue
             
             # Validate that this is a video file
             is_valid, reason, file_info = validate_video_file(bucket, key)

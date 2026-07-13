@@ -14,45 +14,57 @@ export class HighlightProcessorStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
 
-    // Create VPC
+    // ═══════════════════════════════════════════════════════════════════════
+    // PARAMETERS — The Amplify-managed bucket name is passed at deploy time
+    // ═══════════════════════════════════════════════════════════════════════
+    const amplifyBucketName = new cdk.CfnParameter(this, 'AmplifyBucketName', {
+      type: 'String',
+      description: 'Name of the Amplify-managed S3 bucket (scua-video-storage). Find in amplify_outputs.json → storage.bucket_name',
+    });
+
+    // Import the existing Amplify bucket (cross-stack reference)
+    const videoBucket = s3.Bucket.fromBucketName(this, 'AmplifyVideoBucket', amplifyBucketName.valueAsString);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // NETWORKING
+    // ═══════════════════════════════════════════════════════════════════════
     const vpc = new ec2.Vpc(this, 'VideoProcessorVPC', {
       maxAzs: 2,
       natGateways: 1,
     });
 
-    // Create Security Group for video processing tasks
     const securityGroup = new ec2.SecurityGroup(this, 'VideoProcessorSG', {
       vpc,
       description: 'Security group for video processor ECS tasks',
       allowAllOutbound: true,
     });
 
-    // Create ECS Cluster
+    // ═══════════════════════════════════════════════════════════════════════
+    // ECS CLUSTER + GPU AUTO SCALING (min 0 for cost savings)
+    // ═══════════════════════════════════════════════════════════════════════
     const cluster = new ecs.Cluster(this, 'VideoProcessorCluster', {
       vpc,
-      clusterName: `video-processor-cluster-${this.stackName}`,
+      clusterName: `scua-video-processor-${this.stackName}`,
     });
 
-    // Create Auto Scaling Group for GPU instances
     const autoScalingGroup = new autoscaling.AutoScalingGroup(this, 'VideoProcessorASG', {
       vpc,
-      // GPU-enabled instance type for ML workloads
-      // in lib/highlight-processor-stack.ts
-      instanceType: ec2.InstanceType.of(ec2.InstanceClass.G4DN, ec2.InstanceSize.XLARGE2),
-      machineImage: ecs.EcsOptimizedImage.amazonLinux2023(ecs.AmiHardwareType.GPU),
-      minCapacity: 0, // Can scale to 0 to save costs when idle
+      // CPU instance for dead-space detection (ffmpeg-only, no GPU needed)
+      // Switch back to G4DN when GPU quota is approved for VLM content search
+      instanceType: ec2.InstanceType.of(ec2.InstanceClass.C5, ec2.InstanceSize.XLARGE),
+      machineImage: ecs.EcsOptimizedImage.amazonLinux2023(),
+      minCapacity: 0,
       maxCapacity: 2,
       securityGroup,
       blockDevices: [{
         deviceName: '/dev/xvda',
-        volume: autoscaling.BlockDeviceVolume.ebs(100, {  // 100 GB root volume
+        volume: autoscaling.BlockDeviceVolume.ebs(100, {
           deleteOnTermination: true,
           volumeType: autoscaling.EbsDeviceVolumeType.GP3,
         }),
       }],
     });
-    
-    // Add capacity to cluster
+
     const capacityProvider = new ecs.AsgCapacityProvider(this, 'VideoProcessorCP', {
       autoScalingGroup,
       enableManagedScaling: true,
@@ -61,19 +73,22 @@ export class HighlightProcessorStack extends cdk.Stack {
 
     cluster.addAsgCapacityProvider(capacityProvider);
 
-    // Create CloudWatch Log Group
+    // ═══════════════════════════════════════════════════════════════════════
+    // LOGGING
+    // ═══════════════════════════════════════════════════════════════════════
     const logGroup = new logs.LogGroup(this, 'VideoProcessorLogs', {
-      logGroupName: `/ecs/video-processor-${this.stackName}`,
+      logGroupName: `/ecs/scua-video-processor`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Create Task Role
+    // ═══════════════════════════════════════════════════════════════════════
+    // IAM ROLES
+    // ═══════════════════════════════════════════════════════════════════════
     const taskRole = new iam.Role(this, 'VideoProcessorTaskRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
     });
 
-    // Create Execution Role
     const executionRole = new iam.Role(this, 'VideoProcessorExecutionRole', {
       assumedBy: new iam.ServicePrincipal('ecs-tasks.amazonaws.com'),
       managedPolicies: [
@@ -81,24 +96,40 @@ export class HighlightProcessorStack extends cdk.Stack {
       ],
     });
 
-    // Grant the EC2 Instance Role permission to use the Launch Template.
-    // This fixes the original "You are not authorized to use launch template" error.
     autoScalingGroup.role.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ['ec2:UseLaunchTemplate'],
-        resources: ['*'], // Ideally, scope this down to the specific launch template ARN
+        resources: ['*'],
       })
     );
 
-    // Create Task Definition
+    // Grant ECS task role access to the Amplify bucket
+    // Read from video/*, write to edit/* and segment/*
+    taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:GetObject', 's3:HeadObject'],
+      resources: [videoBucket.arnForObjects('video/*')],
+    }));
+    taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:PutObject', 's3:GetObject'],
+      resources: [
+        videoBucket.arnForObjects('edit/*'),
+        videoBucket.arnForObjects('segment/*'),
+        videoBucket.arnForObjects('review/*'),
+      ],
+    }));
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // ECS TASK DEFINITION
+    // ═══════════════════════════════════════════════════════════════════════
     const taskDefinition = new ecs.Ec2TaskDefinition(this, 'VideoProcessorTaskDef', {
-      family: 'video-processor',
+      family: 'scua-video-processor',
       taskRole,
       executionRole,
       networkMode: ecs.NetworkMode.AWS_VPC,
     });
 
-    // Add Container to Task Definition
     taskDefinition.addContainer('video-processor', {
       image: ecs.ContainerImage.fromAsset('./video-processing', {
         platform: Platform.LINUX_AMD64,
@@ -106,46 +137,34 @@ export class HighlightProcessorStack extends cdk.Stack {
           'HUGGINGFACE_TOKEN': process.env.HUGGINGFACE_TOKEN || ''
         }
       }),
-      // Resources for GPU-intensive ML task
-      memoryLimitMiB: 30720, // ~30GB for g4dn.2xlarge (32GiB total)
-      cpu: 8192, // 8 vCPUs for g4dn.2xlarge (1024 CPU units per vCPU)
-      gpuCount: 1,           // Request 1 GPU
+      memoryLimitMiB: 7168,  // ~7GB for c5.xlarge (8GiB total)
+      cpu: 4096,             // 4 vCPUs for c5.xlarge
+      // gpuCount: 1,        // Re-enable when switching back to G4DN
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'video-processor',
         logGroup,
       }),
-      // Set the command to run the main orchestrator
       command: ["python3", "main.py"],
       environment: {
-        // Add AWS_REGION for boto3
         AWS_REGION: this.region,
+        // Output paths matching SCUA frontend storage conventions
+        RESULT_PREFIX: 'edit',
+        SEGMENT_PREFIX: 'segment',
       },
       essential: true,
     });
 
-    // Create S3 Bucket
-    const videoBucket = new s3.Bucket(this, 'VideoBucket', {
-      // Only stackName can contain uppercase; lowercasing the whole string would
-      // mangle the unresolved account/region tokens and break synth without creds.
-      bucketName: `video-uploads-${this.account}-${this.region}-${this.stackName.toLowerCase()}`,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      autoDeleteObjects: true,
-    });
-
-    // Grant specific S3 permissions to the task role
-    videoBucket.grantRead(taskRole, 'videos/*');
-    videoBucket.grantReadWrite(taskRole, 'results/*');
-
-    // Create a dedicated Log Group for the Lambda
+    // ═══════════════════════════════════════════════════════════════════════
+    // TRIGGER LAMBDA — fired by S3 video/* uploads on the Amplify bucket
+    // ═══════════════════════════════════════════════════════════════════════
     const triggerLambdaLogGroup = new logs.LogGroup(this, 'TriggerLambdaLogGroup', {
-      logGroupName: `/aws/lambda/${this.stackName}-VideoTriggerLambda`,
+      logGroupName: `/aws/lambda/scua-video-trigger`,
       retention: logs.RetentionDays.ONE_WEEK,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Create Lambda Function
     const triggerLambda = new lambda.Function(this, 'VideoTriggerLambda', {
-      runtime: lambda.Runtime.PYTHON_3_9,
+      runtime: lambda.Runtime.PYTHON_3_12,
       handler: 'handler.lambda_handler',
       code: lambda.Code.fromAsset('./lambda'),
       logGroup: triggerLambdaLogGroup,
@@ -160,42 +179,130 @@ export class HighlightProcessorStack extends cdk.Stack {
       },
     });
 
-    // Grant Lambda permissions to run the ECS task
+    // Lambda permissions
     triggerLambda.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['ecs:RunTask'],
       resources: [taskDefinition.taskDefinitionArn],
     }));
 
-    // Grant Lambda permission to read S3 object metadata
     triggerLambda.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['s3:GetObject', 's3:GetObjectAttributes', 's3:HeadObject'],
-      resources: [videoBucket.arnForObjects('videos/*')],
+      resources: [videoBucket.arnForObjects('video/*'), videoBucket.arnForObjects('edit/*')],
     }));
 
-    // Grant Lambda permission to pass roles to ECS
     triggerLambda.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['iam:PassRole'],
       resources: [taskRole.roleArn, executionRole.roleArn],
     }));
 
-    // Add S3 notification to trigger Lambda
-    videoBucket.addEventNotification(
-      s3.EventType.OBJECT_CREATED,
-      new s3n.LambdaDestination(triggerLambda),
-      { prefix: 'videos/' }
-    );
+    // ═══════════════════════════════════════════════════════════════════════
+    // S3 NOTIFICATION — trigger Lambda on video/* uploads
+    // Since this is an imported bucket, we must add the notification manually
+    // via a custom resource or use bucket notification configuration.
+    // ═══════════════════════════════════════════════════════════════════════
 
-    // NOTE: The s3n.LambdaDestination construct automatically adds the necessary 
-    // lambda:InvokeFunction permission to the Lambda's policy.
-    // The explicit `triggerLambda.addPermission` call is redundant and has been removed.
-    
-    // Outputs
-    new cdk.CfnOutput(this, 'BucketName', {
-      value: videoBucket.bucketName,
-      description: 'S3 bucket for video uploads',
+    // Allow S3 to invoke the Lambda
+    triggerLambda.addPermission('AllowS3Invoke', {
+      principal: new iam.ServicePrincipal('s3.amazonaws.com'),
+      sourceArn: videoBucket.bucketArn,
+      sourceAccount: this.account,
+    });
+
+    // Custom resource to add notification to the existing Amplify bucket
+    const notificationHandler = new lambda.Function(this, 'S3NotificationHandler', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.handler',
+      timeout: cdk.Duration.minutes(2),
+      code: lambda.Code.fromInline(`
+import boto3
+import cfnresponse
+import json
+
+def handler(event, context):
+    try:
+        s3 = boto3.client('s3')
+        bucket = event['ResourceProperties']['BucketName']
+        lambda_arn = event['ResourceProperties']['LambdaArn']
+        notification_id = event['ResourceProperties'].get('NotificationId', 'scua-video-trigger')
+
+        if event['RequestType'] in ['Create', 'Update']:
+            # Get existing notification config
+            existing = s3.get_bucket_notification_configuration(Bucket=bucket)
+            existing.pop('ResponseMetadata', None)
+
+            # Remove any existing notifications with our IDs
+            lambda_configs = existing.get('LambdaFunctionConfigurations', [])
+            our_ids = {notification_id, notification_id + '-trim'}
+            lambda_configs = [c for c in lambda_configs if c.get('Id') not in our_ids]
+
+            # Add our notifications
+            lambda_configs.append({
+                'Id': notification_id,
+                'LambdaFunctionArn': lambda_arn,
+                'Events': ['s3:ObjectCreated:*'],
+                'Filter': {
+                    'Key': {
+                        'FilterRules': [
+                            {'Name': 'prefix', 'Value': 'video/'}
+                        ]
+                    }
+                }
+            })
+            lambda_configs.append({
+                'Id': notification_id + '-trim',
+                'LambdaFunctionArn': lambda_arn,
+                'Events': ['s3:ObjectCreated:*'],
+                'Filter': {
+                    'Key': {
+                        'FilterRules': [
+                            {'Name': 'prefix', 'Value': 'edit/'},
+                            {'Name': 'suffix', 'Value': '_trim_request.json'}
+                        ]
+                    }
+                }
+            })
+            existing['LambdaFunctionConfigurations'] = lambda_configs
+            s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
+
+        elif event['RequestType'] == 'Delete':
+            existing = s3.get_bucket_notification_configuration(Bucket=bucket)
+            existing.pop('ResponseMetadata', None)
+            lambda_configs = existing.get('LambdaFunctionConfigurations', [])
+            lambda_configs = [c for c in lambda_configs if c.get('Id') not in (notification_id, notification_id + '-trim')]
+            existing['LambdaFunctionConfigurations'] = lambda_configs
+            s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
+
+        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+    except Exception as e:
+        print(f"Error: {e}")
+        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+`),
+    });
+
+    notificationHandler.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:GetBucketNotification', 's3:PutBucketNotification'],
+      resources: [videoBucket.bucketArn],
+    }));
+
+    new cdk.CustomResource(this, 'S3NotificationConfig', {
+      serviceToken: notificationHandler.functionArn,
+      properties: {
+        BucketName: amplifyBucketName.valueAsString,
+        LambdaArn: triggerLambda.functionArn,
+        NotificationId: 'scua-video-trim-trigger',
+      },
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // OUTPUTS
+    // ═══════════════════════════════════════════════════════════════════════
+    new cdk.CfnOutput(this, 'AmplifyBucket', {
+      value: amplifyBucketName.valueAsString,
+      description: 'Amplify-managed S3 bucket being used for video storage',
     });
 
     new cdk.CfnOutput(this, 'ClusterName', {
@@ -208,16 +315,9 @@ export class HighlightProcessorStack extends cdk.Stack {
       description: 'CloudWatch log group for ECS tasks',
     });
 
-    new cdk.CfnOutput(this, 'LambdaLogGroupName', {
-      value: triggerLambda.logGroup?.logGroupName || 'No log group',
-      description: 'CloudWatch log group for the trigger Lambda function',
-    });
-
-    
-    // Debug output for troubleshooting
     new cdk.CfnOutput(this, 'TaskDefinitionArn', {
       value: taskDefinition.taskDefinitionArn,
-      description: 'Task definition ARN for debugging',
+      description: 'Task definition ARN',
     });
   }
 }
