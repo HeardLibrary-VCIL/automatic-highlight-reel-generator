@@ -185,7 +185,17 @@ def merge_runs(regions, gap):
     return runs
 
 
-def propose_window(regions, duration, gap, edge_tol, min_keep, mode):
+def _covered_fraction(start, end, cover):
+    """Fraction of [start, end] covered by the union of `cover` regions.
+    `cover` (e.g. silencedetect output) is assumed non-overlapping."""
+    span = end - start
+    if span <= 0:
+        return 0.0
+    covered = sum(max(0.0, min(end, c.end) - max(start, c.start)) for c in cover)
+    return covered / span
+
+
+def propose_window(regions, duration, gap, edge_tol, min_keep, mode, tail_freeze_min=30.0):
     """Returns (content_start, content_end, status, notes).
 
     Head and tail are treated ASYMMETRICALLY:
@@ -195,7 +205,9 @@ def propose_window(regions, duration, gap, edge_tol, min_keep, mode):
         shots) is legitimately static, so letting freeze define the trailing
         run chains real content into "dead" and cuts the program short. Only
         black+silence may define the trailing dead run; the cut still anchors
-        on black.
+        on black -- EXCEPT a freeze that is both very long (>= tail_freeze_min)
+        AND silent, which is a dead held-frame/slate, not real program, and may
+        anchor the cut.
     """
     content_start, content_end = 0.0, duration
     notes = []
@@ -204,7 +216,21 @@ def propose_window(regions, duration, gap, edge_tol, min_keep, mode):
     ns_runs = merge_runs([r for r in regions if r.kind != "freeze"], gap)  # black+silence
 
     head = next((r for r in all_runs if r.start <= edge_tol), None)
+
+    # Tail: first prefer a dead run that actually reaches EOF (within edge_tol).
     tail = next((r for r in reversed(ns_runs) if r.end >= duration - edge_tol), None)
+    # Fallback for tape run-out shaped like black -> snow -> a few stray frames:
+    # the trailing dead run stops short of EOF because junk frames decode after
+    # the snow, so the EOF test above misses it. Snow is a dead-signal marker
+    # that never occurs inside real program, so the last snow-bearing run in the
+    # back half of the file IS the tail; the frames after it are junk. A black
+    # cut in mid-program carries no snow, so this can't misfire on one.
+    if tail is None:
+        tail = next((r for r in reversed(ns_runs)
+                     if r.snows and r.start > edge_tol and r.end > duration / 2), None)
+        if tail is not None:
+            notes.append(f"tail anchored on trailing snow {tail.start:.1f}-{tail.end:.1f}s "
+                         f"(dead run stops before EOF; frames after the snow treated as junk)")
 
     # Whole-file-dead guard: the leading all-signal run reaches the end.
     if head is not None and head.end >= duration - edge_tol:
@@ -229,6 +255,20 @@ def propose_window(regions, duration, gap, edge_tol, min_keep, mode):
     if tail:
         # cut where the trailing dead block begins: the first black OR snow.
         tail_anchors = [b[0] for b in tail.blacks] + [b[0] for b in tail.snows]
+        # A long, SILENT freeze inside the trailing run is a dead held frame /
+        # slate (e.g. a "please stand by" card held for minutes), not the merely
+        # static closing content that freeze-exclusion protects. Let its start
+        # anchor the cut too. Guarded on both length and silence so a legitimate
+        # locked-off closing shot (which has audio, and rarely freezes for this
+        # long) is untouched.
+        silences = [r for r in regions if r.kind == "silence"]
+        for r in regions:
+            if (r.kind == "freeze" and r.end - r.start >= tail_freeze_min
+                    and tail.start - gap <= r.start and r.end <= tail.end + gap
+                    and _covered_fraction(r.start, r.end, silences) >= 0.8):
+                tail_anchors.append(r.start)
+                notes.append(f"tail cut brought forward to a {r.end - r.start:.0f}s silent "
+                             f"freeze at {r.start:.1f}s (dead held frame/slate)")
         if mode == "black" and tail_anchors:
             content_end = min(tail_anchors)
         elif mode == "black":
@@ -289,7 +329,7 @@ def probe_video(input_video, *, min_dur=0.5, black_pic_th=0.98, freeze_db=-30.0,
 
 
 def analyze(input_video=None, *, from_log=None, mode="black", merge_gap=0.5,
-            edge_tol=5.0, min_keep=0.5, **probe_kwargs) -> Proposal:
+            edge_tol=5.0, min_keep=0.5, tail_freeze_min=30.0, **probe_kwargs) -> Proposal:
     """Probe a video (or re-score a saved log) and propose a content window.
 
     Does NOT write any video. Pass detector overrides through as keyword args
@@ -300,7 +340,8 @@ def analyze(input_video=None, *, from_log=None, mode="black", merge_gap=0.5,
         if not input_video:
             raise ValueError("analyze() needs input_video or from_log")
         duration, regions = probe_video(input_video, **probe_kwargs)
-    cs, ce, status, notes = propose_window(regions, duration, merge_gap, edge_tol, min_keep, mode)
+    cs, ce, status, notes = propose_window(regions, duration, merge_gap, edge_tol,
+                                           min_keep, mode, tail_freeze_min)
     return Proposal(duration, cs, ce, status, notes, regions)
 
 
@@ -355,6 +396,9 @@ def main():
                         "~5s tolerates the unstable signal that often precedes a bars leader.")
     p.add_argument("--min-keep", type=float, default=0.5,
                    help="Flag NEEDS_REVIEW if kept span < this fraction of the file.")
+    p.add_argument("--tail-freeze-min", type=float, default=30.0,
+                   help="A trailing freeze at least this long AND silent is treated as a dead "
+                        "held frame/slate and anchors the tail cut. Raise to be more conservative.")
     args = p.parse_args()
 
     if not args.from_log and not args.input_video:
@@ -365,6 +409,7 @@ def main():
     prop = analyze(
         input_video=args.input_video, from_log=args.from_log, mode=args.mode,
         merge_gap=args.merge_gap, edge_tol=args.edge_tol, min_keep=args.min_keep,
+        tail_freeze_min=args.tail_freeze_min,
         min_dur=args.min_dur, black_pic_th=args.black_pic_th, freeze_db=args.freeze_db,
         silence_db=args.silence_db, bars_window=args.bars_window, snow_window=args.snow_window,
         no_black=args.no_black, no_freeze=args.no_freeze, no_silence=args.no_silence,
