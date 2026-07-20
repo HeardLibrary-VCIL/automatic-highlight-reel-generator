@@ -1,6 +1,7 @@
-# Slim CPU image for head/tail dead-space trimming.
-# Uses ffmpeg (black/freeze/silence) + opencv (bars/snow) + boto3 (S3 I/O).
-# No GPU, PyTorch, transformers, or PaliGemma -- that was the old diving pipeline.
+# Slim CPU image for dead-space trimming + content-type segmentation.
+# Uses ffmpeg (black/freeze/silence) + opencv (bars/snow + frame sampling)
+# + scenedetect (shot boundaries) + anthropic (Claude vision classify) + boto3 (S3 I/O).
+# No GPU, PyTorch, transformers, or PaliGemma -- classification runs on Anthropic's side.
 # (Recover the old GPU Dockerfile from git history if the VLM path is needed again.)
 FROM python:3.10-slim
 

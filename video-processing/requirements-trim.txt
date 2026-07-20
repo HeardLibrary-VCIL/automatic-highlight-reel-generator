@@ -1,6 +1,10 @@
-# Minimal deps for the head/tail trimming backend (main.py -> analyze_deadspace).
+# Deps for the video processing backend (main.py -> analyze_deadspace + segment_shots).
 # ffmpeg is provided by the OS layer (see Dockerfile), not pip.
 boto3==1.39.12
 botocore==1.39.12
 numpy==2.1.2
 opencv-python-headless==4.12.0.88
+
+# Content-type segmentation (segment_shots.py): shot detection + Claude vision classify
+scenedetect==0.6.5
+anthropic==0.52.0

@@ -1,9 +1,16 @@
-"""ECS entry point: download video from S3, detect dead space, write segments.
+"""ECS entry point: download video from S3, detect dead space, segment content, write results.
 
 Integrated with SCUA-Video-Editing Amplify frontend:
   - Input  : S3_BUCKET / S3_KEY pointing at uploaded video under `video/` prefix
   - Output : segment JSON  → `segment/{basename}.json`  (for the Editor timeline)
              review marker → `review/{basename}.txt`    (if NEEDS_REVIEW)
+
+Pipeline stages:
+  1. Dead-space detection (analyze_deadspace): find head/tail dead regions
+  2. Content-type segmentation (segment_shots): classify content spans into
+     a closed category set (dance, football, tv show, interview, political ad,
+     PSA, or 'other') using shot-boundary detection + Claude vision API
+  3. Write combined segment JSON to S3 for the Editor UI
 
 The actual video trimming is triggered later by the user from the Editor UI,
 after they review and adjust the auto-detected segments.
@@ -21,6 +28,7 @@ import boto3
 from botocore.exceptions import ClientError
 
 from analyze_deadspace import analyze, apply_trim
+from segment_shots import segment_video_shots
 
 # --- Configuration ---
 logging.basicConfig(
@@ -33,6 +41,10 @@ log = logging.getLogger(__name__)
 # Output prefixes — match SCUA Amplify storage paths
 SEGMENT_PREFIX = os.environ.get("SEGMENT_PREFIX", "segment").strip("/")
 TRIM_MODE = os.environ.get("TRIM_MODE", "black")
+# Content-type segmentation: enabled by default when ANTHROPIC_API_KEY is set
+CONTENT_SEGMENT = os.environ.get("CONTENT_SEGMENT", "auto")  # "auto", "on", "off"
+SEGMENT_DETECTOR = os.environ.get("SEGMENT_DETECTOR", "adaptive")  # "adaptive" or "content"
+SEGMENT_MIN_SHOT = float(os.environ.get("SEGMENT_MIN_SHOT", "1.5"))
 
 
 def segment_key(s3_key: str) -> str:
@@ -41,46 +53,90 @@ def segment_key(s3_key: str) -> str:
     return f"{SEGMENT_PREFIX}/{stem}.json"
 
 
-def build_segment_json(s3_key: str, prop) -> dict:
-    """Build a segment JSON matching SCUA Editor format from the trim proposal.
+def _should_run_content_segmentation() -> bool:
+    """Decide whether to run content-type segmentation (needs ANTHROPIC_API_KEY)."""
+    if CONTENT_SEGMENT == "off":
+        return False
+    if CONTENT_SEGMENT == "on":
+        return True
+    # "auto": run only if the API key is available
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
 
-    Creates segments:
-      - D (Deadspace) for detected head/tail dead regions
-      - I (Interview/Content) for the kept content span
+
+def build_segment_json(s3_key: str, prop, content_segments=None) -> dict:
+    """Build a segment JSON matching SCUA Editor format.
+
+    If `content_segments` is provided (from segment_shots), use those richer
+    labels (dance performance, football game, etc.). Otherwise fall back to the
+    simple D/I dead-space segments.
     """
     stem = Path(s3_key).name.rsplit(".", 1)[0]
     segments = []
 
-    # Head deadspace
-    if prop.content_start > 1.0:
+    if content_segments:
+        # Use the shot-based content-type segmentation results
+        # Still include head/tail dead-space markers if present
+        if prop.content_start > 1.0:
+            segments.append({
+                "segment_start": 0,
+                "segment_end": round(prop.content_start, 2),
+                "segment_type": "D",
+                "title": "Head dead space (auto-detected)",
+            })
+
+        for seg in content_segments:
+            # Map content-type labels to segment_type codes for the Editor:
+            #   Target categories → "C" (content, labeled)
+            #   "other" → "I" (generic content / interview)
+            seg_type = "I" if seg.label == "other" else "C"
+            entry = {
+                "segment_start": round(seg.start, 2),
+                "segment_end": round(seg.end, 2),
+                "segment_type": seg_type,
+                "title": seg.label.title(),
+                "content_label": seg.label,
+            }
+            if seg.note:
+                entry["note"] = seg.note
+            segments.append(entry)
+
+        if prop.duration - prop.content_end > 1.0:
+            segments.append({
+                "segment_start": round(prop.content_end, 2),
+                "segment_end": round(prop.duration, 2),
+                "segment_type": "D",
+                "title": "Tail dead space (auto-detected)",
+            })
+    else:
+        # Fallback: simple dead-space-only segments
+        if prop.content_start > 1.0:
+            segments.append({
+                "segment_start": 0,
+                "segment_end": round(prop.content_start, 2),
+                "segment_type": "D",
+                "title": "Head dead space (auto-detected)",
+            })
+
         segments.append({
-            "segment_start": 0,
-            "segment_end": round(prop.content_start, 2),
-            "segment_type": "D",
-            "title": "Head dead space (auto-detected)",
+            "segment_start": round(prop.content_start, 2),
+            "segment_end": round(prop.content_end, 2),
+            "segment_type": "I",
+            "title": "Content",
         })
 
-    # Main content
-    segments.append({
-        "segment_start": round(prop.content_start, 2),
-        "segment_end": round(prop.content_end, 2),
-        "segment_type": "I",
-        "title": "Content",
-    })
-
-    # Tail deadspace
-    if prop.duration - prop.content_end > 1.0:
-        segments.append({
-            "segment_start": round(prop.content_end, 2),
-            "segment_end": round(prop.duration, 2),
-            "segment_type": "D",
-            "title": "Tail dead space (auto-detected)",
-        })
+        if prop.duration - prop.content_end > 1.0:
+            segments.append({
+                "segment_start": round(prop.content_end, 2),
+                "segment_end": round(prop.duration, 2),
+                "segment_type": "D",
+                "title": "Tail dead space (auto-detected)",
+            })
 
     return {
         "video": stem,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "auto_detected": True,
+        "content_segmented": content_segments is not None,
         "trim_status": prop.status,
         "duration": round(prop.duration, 2),
         "kept_pct": round(prop.kept_pct, 1),
@@ -228,15 +284,46 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             for n in prop.notes:
                 log.info(f"  note: {n}")
 
-            # --- STAGE 2: WRITE SEGMENTS ---
+            # --- STAGE 2: CONTENT SEGMENTATION ---
             stage2_start = time.time()
+            content_segments = None
+
+            if _should_run_content_segmentation() and prop.status == "OK" and prop.kept > 0:
+                log.info("Running content-type segmentation (segment_shots)...")
+                try:
+                    _, _, content_segments = segment_video_shots(
+                        str(local_video_path),
+                        detector=SEGMENT_DETECTOR,
+                        min_shot=SEGMENT_MIN_SHOT,
+                        trim=True,         # use dead-space window
+                        classify=True,
+                        smooth=True,
+                    )
+                    log.info(
+                        f"Content segmentation complete: {len(content_segments)} segments "
+                        f"in {time.time() - stage2_start:.2f}s"
+                    )
+                    for s in content_segments:
+                        label = f"{s.label} ({s.note})" if s.note else s.label
+                        log.info(f"  [{s.start:.2f}s -> {s.end:.2f}s] {label}")
+                except Exception as e:
+                    log.warning(f"Content segmentation failed (falling back to dead-space only): {e}")
+                    log.warning(traceback.format_exc())
+                    content_segments = None
+            elif not _should_run_content_segmentation():
+                log.info("Content segmentation disabled (no ANTHROPIC_API_KEY or CONTENT_SEGMENT=off)")
+            else:
+                log.info("Skipping content segmentation (trim status not OK or no content)")
+
+            # --- STAGE 3: WRITE SEGMENTS ---
+            stage3_start = time.time()
             seg_s3_key = segment_key(s3_key)
 
             if prop.status == "NEEDS_REVIEW":
                 write_review_marker(s3_client, s3_bucket, s3_key, prop)
 
             # Always write segment JSON so the Editor can display it
-            seg_json = build_segment_json(s3_key, prop)
+            seg_json = build_segment_json(s3_key, prop, content_segments)
             log.info(f"Uploading segment JSON to s3://{s3_bucket}/{seg_s3_key}")
             s3_client.put_object(
                 Bucket=s3_bucket,
@@ -245,8 +332,8 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 ContentType="application/json",
             )
 
-            log.info(f"--- Stage 2 (Write Segments) completed in "
-                     f"{time.time() - stage2_start:.2f}s ---")
+            log.info(f"--- Stage 3 (Write Segments) completed in "
+                     f"{time.time() - stage3_start:.2f}s ---")
 
         except ClientError as e:
             log.error(f"S3 error: {e.response['Error']['Message']}")
