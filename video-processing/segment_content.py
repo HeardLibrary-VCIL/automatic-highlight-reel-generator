@@ -27,9 +27,10 @@ vocabulary of already-used labels is fed back each call to curb label drift.
 
 Output: a segments.json timeline. No video is cut here.
 
-Setup (one-time):
+Setup (one-time): model calls go through Amazon Bedrock (see bedrock.py), so no
+ANTHROPIC_API_KEY -- reuse the project AWS creds:
     pip install anthropic            # not in requirements-trim.txt yet
-    export ANTHROPIC_API_KEY=sk-...  # or `ant auth login`
+    export AWS_SHARED_CREDENTIALS_FILE=../.env AWS_PROFILE=337513903342_PowerUserAccess
 
 Runs the head/tail dead-space trim first (analyze_deadspace) and samples only
 the resulting content window, then caps the timeline at --max-segments (default
@@ -61,8 +62,10 @@ import cv2
 # Reuse the trimmer directly: get_duration for probing, analyze for the
 # head/tail dead-space window so we segment only the real program.
 from analyze_deadspace import get_duration, analyze
+# All model calls go through Amazon Bedrock (project AWS creds, no ANTHROPIC_API_KEY).
+from bedrock import make_client, BEDROCK_MODEL
 
-CLASSIFY_MODEL = "claude-haiku-4-5"  # cheap + vision; bump to claude-sonnet-5 if labels are weak
+CLASSIFY_MODEL = BEDROCK_MODEL  # Bedrock Haiku 4.5 (vision); see bedrock.py for access notes
 
 
 @dataclass
@@ -199,9 +202,9 @@ def classify_window(client, jpegs, model=CLASSIFY_MODEL, interval=30.0,
 
 def label_windows(windows, model=CLASSIFY_MODEL, interval=30.0, categories=None) -> list:
     """Classify each window. Returns [(t, category, description)].
-    Lazily imports anthropic so sampling works without it."""
-    import anthropic
-    client = anthropic.Anthropic()
+    The Bedrock client is built here (not at import) so --no-classify never
+    touches the anthropic SDK / AWS creds."""
+    client = make_client()
     labeled = []
     for t, jpegs in windows:
         cat, desc = classify_window(client, jpegs, model, interval, categories)
@@ -255,8 +258,7 @@ def refine_boundaries(path, segments, *, interval, model=CLASSIFY_MODEL,
     Probe the midpoint, ask classify_ab: if it still looks like A, the change is
     later (raise the low bound); if B, earlier (lower the high bound). Converge,
     then set the shared boundary to the first B-looking time."""
-    import anthropic
-    client = anthropic.Anthropic()
+    client = make_client()
     cap = cv2.VideoCapture(path)
     for i in range(len(segments) - 1):
         seg, nxt = segments[i], segments[i + 1]

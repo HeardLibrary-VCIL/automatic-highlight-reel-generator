@@ -8,3 +8,9 @@ __pycache__/
 *.log
 .DS_Store
 hf_cache/
+
+# Local dev pipeline outputs — the container regenerates these per video.
+asr_*.json
+transcript_*.json
+shots_fused_*.json
+segments*.json

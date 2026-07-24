@@ -120,6 +120,35 @@ export class HighlightProcessorStack extends cdk.Stack {
       ],
     }));
 
+    // ── Amazon Transcribe (Stage A of the segmentation pipeline) ──────────────
+    // Transcribe reads the media straight out of the Amplify bucket using THIS
+    // role's S3 permissions (same-account access), so the video never has to be
+    // copied anywhere. With no OutputBucketName the result lands in a
+    // service-managed bucket and comes back as a presigned URL, so no extra
+    // write permission is needed. Job ARNs are minted per run -> resource '*'.
+    taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'transcribe:StartTranscriptionJob',
+        'transcribe:GetTranscriptionJob',
+      ],
+      resources: ['*'],
+    }));
+
+    // ── Amazon Bedrock (Stages C/D: taxonomy discovery + multimodal labeling) ─
+    // Both the frame classification and the transcript labeling call Claude via
+    // Bedrock, so there is no ANTHROPIC_API_KEY anywhere in the stack. Invoking a
+    // cross-region inference profile (us.anthropic.*) requires permission on BOTH
+    // the profile ARN and the foundation models it routes to.
+    taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['bedrock:InvokeModel'],
+      resources: [
+        'arn:aws:bedrock:*::foundation-model/anthropic.*',
+        `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/*`,
+      ],
+    }));
+
     // ═══════════════════════════════════════════════════════════════════════
     // ECS TASK DEFINITION
     // ═══════════════════════════════════════════════════════════════════════
@@ -146,7 +175,10 @@ export class HighlightProcessorStack extends cdk.Stack {
       }),
       command: ["python3", "main.py"],
       environment: {
+        // botocore resolves region from AWS_DEFAULT_REGION; set both so every
+        // boto3 client (Transcribe has no global-endpoint fallback) has a region.
         AWS_REGION: this.region,
+        AWS_DEFAULT_REGION: this.region,
         // Output paths matching SCUA frontend storage conventions
         RESULT_PREFIX: 'edit',
         SEGMENT_PREFIX: 'segment',
