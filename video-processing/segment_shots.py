@@ -26,8 +26,9 @@ Usage:
     python segment_shots.py video.mp4 --no-classify   # shots only, no API (free)
     python segment_shots.py video.mp4 --min-shot 2.0  # coalesce sub-2s micro-cuts
 
-Setup: same as segment_content.py -- `pip install anthropic scenedetect` and
-`export ANTHROPIC_API_KEY=...` (classify step only; --no-classify needs neither).
+Setup: same as segment_content.py -- `pip install anthropic scenedetect` and the
+project AWS creds for Bedrock (classify step only; --no-classify needs neither):
+`export AWS_SHARED_CREDENTIALS_FILE=../.env AWS_PROFILE=337513903342_PowerUserAccess`.
 """
 
 import argparse
@@ -105,9 +106,9 @@ def sample_shot(cap, start, end, frames_per_shot=3, max_width=768) -> list:
 def label_shots(path, shots, model=CLASSIFY_MODEL, frames_per_shot=3,
                 max_width=768, categories=None) -> list:
     """Classify each shot into the closed set (or OTHER). Returns
-    [(shot_start, category, description)]. One VLM call per shot."""
-    import anthropic
-    client = anthropic.Anthropic()
+    [(shot_start, category, description)]. One VLM call per shot (Bedrock)."""
+    from bedrock import make_client
+    client = make_client()
     cap = cv2.VideoCapture(path)
     labeled = []
     for ss, ee in shots:

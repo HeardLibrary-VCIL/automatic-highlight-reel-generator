@@ -5,6 +5,12 @@ botocore==1.39.12
 numpy==2.1.2
 opencv-python-headless==4.12.0.88
 
-# Content-type segmentation (segment_shots.py): shot detection + Claude vision classify
-scenedetect==0.6.5
-anthropic==0.52.0
+# Audio-visual fusion segmentation.
+#   scenedetect : shot-boundary detection (segment_shots.py).
+#                 MUST be >=0.7 -- we use the FrameTimecode `.seconds` property,
+#                 which 0.6.x does not expose (0.6.x only has get_seconds()).
+#   anthropic   : Claude via AnthropicBedrock (bedrock.py). Signs with the boto3
+#                 credentials already pinned above, so no extra extra is needed.
+# Amazon Transcribe is reached through boto3 -- no separate package.
+scenedetect==0.7
+anthropic==0.117.0
