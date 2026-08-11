@@ -7,6 +7,7 @@ import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
 
@@ -24,6 +25,16 @@ export class HighlightProcessorStack extends cdk.Stack {
 
     // Import the existing Amplify bucket (cross-stack reference)
     const videoBucket = s3.Bucket.fromBucketName(this, 'AmplifyVideoBucket', amplifyBucketName.valueAsString);
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // SECRETS — Anthropic API key for content-type segmentation (Claude vision)
+    // Create in Secrets Manager before deploy:
+    //   aws secretsmanager create-secret --name scua/anthropic-api-key \
+    //     --secret-string "sk-ant-..."
+    // ═══════════════════════════════════════════════════════════════════════
+    const anthropicApiKeySecret = secretsmanager.Secret.fromSecretNameV2(
+      this, 'AnthropicApiKey', 'scua/anthropic-api-key'
+    );
 
     // ═══════════════════════════════════════════════════════════════════════
     // NETWORKING
@@ -96,6 +107,9 @@ export class HighlightProcessorStack extends cdk.Stack {
       ],
     });
 
+    // Allow execution role to pull the Anthropic API key secret at task start
+    anthropicApiKeySecret.grantRead(executionRole);
+
     autoScalingGroup.role.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ['ec2:UseLaunchTemplate'],
@@ -150,6 +164,12 @@ export class HighlightProcessorStack extends cdk.Stack {
         // Output paths matching SCUA frontend storage conventions
         RESULT_PREFIX: 'edit',
         SEGMENT_PREFIX: 'segment',
+        // Content-type segmentation settings
+        CONTENT_SEGMENT: 'auto',  // "auto" = run if API key present, "off" = skip
+      },
+      secrets: {
+        // Injected from Secrets Manager at task start — the anthropic SDK reads this automatically
+        ANTHROPIC_API_KEY: ecs.Secret.fromSecretsManager(anthropicApiKeySecret),
       },
       essential: true,
     });
