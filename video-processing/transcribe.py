@@ -38,9 +38,29 @@ import urllib.request
 from datetime import datetime, timezone
 
 
-def _media_format(uri: str) -> str:
+# Amazon Transcribe's accepted MediaFormat values — StartTranscriptionJob rejects
+# anything else. Containers outside this set (avi, mkv, wmv, flv, ts/mts/m2ts, ogv,
+# 3gp, …) must have their audio extracted to one of these before transcribing.
+TRANSCRIBE_FORMATS = {"mp3", "mp4", "wav", "flac", "ogg", "amr", "webm", "m4a"}
+# Structurally-MP4 containers Transcribe reads when the format is labelled "mp4".
+_MP4_FAMILY = {"mov", "qt", "m4v"}
+
+
+def media_format(uri: str):
+    """The Transcribe MediaFormat for `uri`, or None when the container is NOT one
+    Transcribe can read directly (so the caller must extract audio to a supported
+    format first). This is the gate main.py uses to decide whether to transcode."""
     ext = os.path.splitext(uri)[1].lstrip(".").lower()
-    return {"mov": "mp4", "m4a": "mp4", "qt": "mp4"}.get(ext, ext or "mp4")
+    if ext in TRANSCRIBE_FORMATS:
+        return ext
+    if ext in _MP4_FAMILY:
+        return "mp4"
+    return None
+
+
+def _media_format(uri: str) -> str:
+    # Back-compat for direct callers: assume mp4 when the container is unknown.
+    return media_format(uri) or "mp4"
 
 
 def start_job(client, media_uri, *, job_name, language="en-US",

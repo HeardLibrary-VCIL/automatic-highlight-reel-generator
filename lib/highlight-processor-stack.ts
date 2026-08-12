@@ -253,6 +253,10 @@ import boto3
 import cfnresponse
 import json
 
+# Stable physical id so CloudFormation does IN-PLACE updates (never a replacement,
+# whose delete-of-the-old-resource would wipe the config the new one just wrote).
+STABLE_ID = 'scua-s3-notification-config'
+
 def handler(event, context):
     try:
         s3 = boto3.client('s3')
@@ -265,12 +269,15 @@ def handler(event, context):
             existing = s3.get_bucket_notification_configuration(Bucket=bucket)
             existing.pop('ResponseMetadata', None)
 
-            # Remove any existing notifications with our IDs
+            # Remove any config that targets OUR Lambda (any id — covers legacy ids
+            # like scua-trim-request-trigger) so we never leave an overlapping edit/
+            # rule behind, plus our known ids, before re-adding a clean set.
             lambda_configs = existing.get('LambdaFunctionConfigurations', [])
-            our_ids = {notification_id, notification_id + '-trim'}
-            lambda_configs = [c for c in lambda_configs if c.get('Id') not in our_ids]
+            our_ids = {notification_id, notification_id + '-trim', notification_id + '-segment', notification_id + '-edit'}
+            lambda_configs = [c for c in lambda_configs
+                              if c.get('LambdaFunctionArn') != lambda_arn and c.get('Id') not in our_ids]
 
-            # Add our notifications
+            # video/ uploads -> segment detection.
             lambda_configs.append({
                 'Id': notification_id,
                 'LambdaFunctionArn': lambda_arn,
@@ -283,15 +290,19 @@ def handler(event, context):
                     }
                 }
             })
+            # ONE edit/ rule (S3 forbids two rules that share the edit/ prefix, even
+            # with different suffixes). The Lambda routes edit/* internally by suffix:
+            #   *_trim_request.json    -> trim
+            #   *_segment_request.json -> re-run segmentation
+            # other edit/ objects (the rendered .mp4s) are ignored by the handler.
             lambda_configs.append({
-                'Id': notification_id + '-trim',
+                'Id': notification_id + '-edit',
                 'LambdaFunctionArn': lambda_arn,
                 'Events': ['s3:ObjectCreated:*'],
                 'Filter': {
                     'Key': {
                         'FilterRules': [
-                            {'Name': 'prefix', 'Value': 'edit/'},
-                            {'Name': 'suffix', 'Value': '_trim_request.json'}
+                            {'Name': 'prefix', 'Value': 'edit/'}
                         ]
                     }
                 }
@@ -300,17 +311,23 @@ def handler(event, context):
             s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
 
         elif event['RequestType'] == 'Delete':
-            existing = s3.get_bucket_notification_configuration(Bucket=bucket)
-            existing.pop('ResponseMetadata', None)
-            lambda_configs = existing.get('LambdaFunctionConfigurations', [])
-            lambda_configs = [c for c in lambda_configs if c.get('Id') not in (notification_id, notification_id + '-trim')]
-            existing['LambdaFunctionConfigurations'] = lambda_configs
-            s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
+            # Only strip our config on a REAL delete of the current resource. During a
+            # replacement CFN deletes the OLD physical resource — skip that so it does
+            # not wipe the config the paired Create just wrote.
+            if event.get('PhysicalResourceId') == STABLE_ID:
+                existing = s3.get_bucket_notification_configuration(Bucket=bucket)
+                existing.pop('ResponseMetadata', None)
+                lambda_configs = existing.get('LambdaFunctionConfigurations', [])
+                our_ids = {notification_id, notification_id + '-trim', notification_id + '-segment', notification_id + '-edit'}
+                lambda_configs = [c for c in lambda_configs
+                                  if c.get('LambdaFunctionArn') != lambda_arn and c.get('Id') not in our_ids]
+                existing['LambdaFunctionConfigurations'] = lambda_configs
+                s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
 
-        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+        cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, STABLE_ID)
     except Exception as e:
         print(f"Error: {e}")
-        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, STABLE_ID)
 `),
     });
 

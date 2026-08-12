@@ -12,10 +12,12 @@ Pipeline stages:
                           (already uploaded by the frontend) -> diarized turns
        B. fuse         -- PySceneDetect shot cuts + join words/speakers onto each
                           shot, then merge shots by speaker continuity
-       C. label        -- ONE Bedrock call discovers this video's own content-type
-                          taxonomy + topic boundaries; ONE multimodal Bedrock call
-                          labels each segment from its words AND a frame
-       D. coalesce     -- merge adjacent same-label spans (not across topics)
+       C. segment/label-- boundaries from an LLM pass + lexical (TextTiling) + pause
+                          cues; split, recompute host/guest role, then ONE multimodal
+                          Bedrock call labels each segment from its words AND a frame
+                          (also reading any on-screen caption)
+       D. coalesce     -- merge by speaker continuity so one interview stays one
+                          segment across camera cuts; score each boundary's confidence
   3. Write combined segment JSON to S3 for the Editor UI
 
 All model calls go through Amazon Bedrock using the ECS task role, so no
@@ -26,11 +28,15 @@ after they review and adjust the auto-detected segments.
 """
 import json
 import os
+import re
+import subprocess
 import sys
 import logging
 import tempfile
 import traceback
 import time
+import uuid
+from dataclasses import replace
 from pathlib import Path
 
 import boto3
@@ -70,10 +76,34 @@ def segment_key(s3_key: str) -> str:
     return f"{SEGMENT_PREFIX}/{stem}.json"
 
 
+def safe_output_name(name: str, fallback_stem: str) -> str:
+    """An S3-safe basename (with a single .mp4) for the trimmed clip. Honors the
+    reviewer's chosen name from the trim request but strips path parts and unsafe
+    chars; falls back to '{fallback_stem}_trimmed.mp4' when no usable name is given."""
+    base = Path((name or "").strip()).name
+    base = re.sub(r"\.mp4$", "", base, flags=re.IGNORECASE).strip()
+    base = re.sub(r"[^A-Za-z0-9._ -]", "", base).strip()
+    return f"{base}.mp4" if base else f"{fallback_stem}_trimmed.mp4"
+
+
 def _should_run_content_segmentation() -> bool:
     """Whether to run the fusion segmentation. Bedrock/Transcribe auth comes from
     the ECS task role, so there is no key to check -- only the explicit off switch."""
     return CONTENT_SEGMENT != "off"
+
+
+def extract_audio(input_video: str, output_audio: str) -> str:
+    """Extract the audio track to an mp4/aac clip for Amazon Transcribe, used when the
+    uploaded container isn't one Transcribe reads directly (avi/mkv/wmv/ts/...). Raises
+    if the source has no audio stream, which the caller treats as "no usable audio" and
+    drops to visual segmentation."""
+    subprocess.run(
+        ["ffmpeg", "-nostdin", "-y", "-i", input_video, "-vn", "-c:a", "aac",
+         "-b:a", "128k", output_audio],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, check=True,
+    )
+    return output_audio
 
 
 def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
@@ -86,22 +116,41 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
     segment's transcript for the reviewer.
     """
     import boto3 as _boto3
-    from transcribe import start_job, wait, fetch_result, to_speaker_turns
+    from transcribe import start_job, wait, fetch_result, to_speaker_turns, media_format
     from segment_shots import detect_shots
     from segment_fuse import attach, merge_by_speaker
     from segment_label import (analyze_program, detect_host, segment_text,
-                               split_on_topics, label_segments, coalesce_labeled)
+                               split_on_topics, label_segments, coalesce_conversation,
+                               lexical_boundaries, dominant_role, segment_guests,
+                               pause_boundaries, boundary_confidence)
     from bedrock import make_client
 
     stem = Path(s3_key).name.rsplit(".", 1)[0]
-    job_name = f"scua-{stem}-{int(time.time())}"[:200]
+    # A UUID suffix keeps the job name unique even if S3's at-least-once delivery (or a
+    # double-click) fires two runs for the same video in the same second -- which would
+    # otherwise collide on the job name and raise a Transcribe ConflictException.
+    job_name = f"scua-{stem}-{int(time.time())}-{uuid.uuid4().hex[:8]}"[:200]
 
     # --- A. transcribe straight from S3 (diarized) ---
     t0 = time.time()
     transcribe_client = _boto3.client("transcribe", region_name=REGION)
     s3_client = _boto3.client("s3", region_name=REGION)
-    log.info(f"[A] Transcribe job {job_name} on s3://{s3_bucket}/{s3_key}")
-    start_job(transcribe_client, f"s3://{s3_bucket}/{s3_key}", job_name=job_name,
+    # Transcribe only reads a fixed set of containers. When the upload isn't one of
+    # them (avi/mkv/wmv/ts/...), extract the audio locally (we already have the file)
+    # to an mp4/aac clip and transcribe THAT, so every accepted upload gets a real
+    # transcript instead of silently degrading to visual-only segmentation. The task
+    # role can write edit/* and Transcribe can read it back with the same role.
+    media_uri = f"s3://{s3_bucket}/{s3_key}"
+    if media_format(s3_key) is None:
+        audio_key = f"edit/{stem}.transcribe.mp4"
+        audio_path = Path(local_video_path).with_name(f"{stem}.transcribe.mp4")
+        extract_audio(str(local_video_path), str(audio_path))
+        s3_client.upload_file(str(audio_path), s3_bucket, audio_key)
+        media_uri = f"s3://{s3_bucket}/{audio_key}"
+        log.info(f"[A] {Path(s3_key).suffix or '(no ext)'} not Transcribe-native; "
+                 f"extracted audio -> s3://{s3_bucket}/{audio_key}")
+    log.info(f"[A] Transcribe job {job_name} on {media_uri}")
+    start_job(transcribe_client, media_uri, job_name=job_name,
               language=TRANSCRIBE_LANGUAGE, max_speakers=MAX_SPEAKERS)
     job = wait(transcribe_client, job_name)
     turns = to_speaker_turns(fetch_result(job, s3_client))
@@ -119,24 +168,101 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
     log.info(f"[B] {len(fused)} shots in window {window[0]:.1f}-{window[1]:.1f}s "
              f"({time.time() - t0:.1f}s)")
 
-    # --- C. discover taxonomy + topic boundaries, then label multimodally ---
+    # --- C. discover taxonomy + multi-cue boundaries, split, then label multimodally ---
     t0 = time.time()
     client = make_client()
     host = detect_host(turns)
-    taxonomy, boundaries = analyze_program(turns, client)
+    taxonomy, llm_bounds = analyze_program(turns, client)
+    # Two more cue sources, both free from data we already have: TextTiling lexical
+    # valleys catch mid-shot boundaries (a host wrap-up rolling into a PSA with no
+    # camera cut); long silences between turns mark broadcast segment breaks. The
+    # speaker-continuity coalesce removes any that fall inside one conversation.
+    lex_bounds = lexical_boundaries(turns)
+    pause_bounds = pause_boundaries(turns)
+    boundaries = sorted(set(llm_bounds) | set(lex_bounds) | set(pause_bounds))
     log.info(f"[C] host={host} | taxonomy: " + ", ".join(t["type"] for t in taxonomy)
-             + f" | {len(boundaries)} topic boundaries")
+             + f" | {len(boundaries)} boundaries (LLM {len(llm_bounds)} + lexical "
+             f"{len(lex_bounds)} + pause {len(pause_bounds)})")
 
     segments = merge_by_speaker(fused, host=host)
     segments = split_on_topics(segments, boundaries, fused)
     for s in segments:
         s["text"], s["speakers"] = segment_text(turns, s["start"], s["end"])
+        # Re-tag role by who actually dominates this (possibly newly split) span, so a
+        # host wrap-up sliced off a guest segment reads as host, not the guest's story.
+        s["role"] = dominant_role(turns, s["start"], s["end"], host)
+        s["guests"] = segment_guests(turns, s["start"], s["end"], host)
 
     labeled = label_segments(segments, client, taxonomy, str(local_video_path), host=host)
-    labeled = coalesce_labeled(labeled)          # --- D. coalesce ---
+    # --- D. coalesce by conversation continuity (guest speaker), not visual label:
+    # a continuous interview stays ONE segment even when the camera keeps cutting.
+    labeled = coalesce_conversation(labeled, host=host)
+    # Score each final boundary by how many independent cues agree, for reviewer triage.
+    shot_starts = sorted({s["start"] for s in fused})
+    labeled = boundary_confidence(labeled, turns, shot_starts, llm_bounds, lex_bounds, host)
     log.info(f"[C/D] {len(segments)} -> {len(labeled)} labeled segments "
              f"({time.time() - t0:.1f}s)")
     return labeled, taxonomy, turns
+
+
+def run_visual_segmentation(local_video_path, prop):
+    """Segment a video that has NO usable audio by CONTENT TYPE — the standard
+    two-level approach (shot-boundary detection -> group shots into scenes) rather
+    than fixed-interval chopping:
+
+        PySceneDetect shots -> classify each shot from a frame with Claude/Bedrock
+        (dance performance / football game / interview / political ad / ... / other,
+        plus a short free-text description) -> merge ADJACENT same-type shots into
+        one scene -> name each scene by its content type.
+
+    So segments read as "Interview", "Football game", "Commercial", etc. instead of
+    generic "Scene N", and the boundaries fall where the CONTENT actually changes.
+    No transcript needed, so this covers the silent / no-speech case.
+
+    Honest limit: a video that is one uniform type throughout (e.g. a raw fixed-
+    camera game) is correctly ONE scene — fine-grained sub-segmentation of a single
+    type (e.g. per-play) needs a domain signal like scoreboard OCR, not implemented.
+    Raises if nothing could be classified so the caller can drop to dead-space only.
+    """
+    from segment_shots import detect_shots, label_shots, _shots_to_segments
+    from segment_content import (confirm_targets, smooth_labels, consolidate_segments,
+                                  CATEGORIES, OTHER, other_note)
+
+    window = (prop.content_start, prop.content_end)
+    shots = detect_shots(str(local_video_path), window, SEGMENT_DETECTOR, SEGMENT_MIN_SHOT)
+
+    # One Bedrock vision call per shot -> (shot_start, content-type, short description).
+    labeled = label_shots(str(local_video_path), shots)
+    kept = {round(ss, 2) for ss, _, _ in labeled}
+    shots = [(ss, ee) for ss, ee in shots if round(ss, 2) in kept]
+    if not shots:
+        raise RuntimeError("visual classification produced no labelled shots")
+
+    cats = [(ss, c) for ss, c, _ in labeled]
+    cats = smooth_labels(confirm_targets(cats, CATEGORIES, min_windows=1))
+    segments = _shots_to_segments(shots, cats)      # merge adjacent same-type shots
+    segments = consolidate_segments(segments, 0, 0.0)
+    for s in segments:
+        if s.label == OTHER:
+            s.note = other_note(s, labeled)          # a description to name the 'other' span
+
+    log.info(f"Visual content-type segmentation: {len(labeled)} shots -> {len(segments)} scenes")
+    for s in segments:
+        note = getattr(s, "note", "")
+        log.info(f"  [{s.start:.1f}s -> {s.end:.1f}s] {s.label}"
+                 + (f" ({note})" if s.label == OTHER and note else ""))
+    return [{
+        "start": round(s.start, 2),
+        "end": round(s.end, 2),
+        # Known content type -> 'C' segment titled by the type; 'other' -> 'I'
+        # segment titled by the model's short description (build_segment_json).
+        "label": s.label,
+        "name": (getattr(s, "note", "") or "") if s.label == OTHER else "",
+        "speakers": [],
+        "on_screen_text": "",
+        "confidence": "",
+        "cues": ["shot", "vlm"],
+    } for s in segments]
 
 
 def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
@@ -191,6 +317,11 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
                 "content_label": label,
                 "speakers": seg.get("speakers", []),
                 "transcript": _transcript(seg["start"], seg["end"]),
+                # On-screen caption (name/title read off the frame) + how much the
+                # boundary before this segment is trusted, for reviewer triage.
+                "caption": seg.get("on_screen_text", ""),
+                "confidence": seg.get("confidence", ""),
+                "boundary_cues": seg.get("cues", []),
             })
 
         if prop.duration - prop.content_end > 1.0:
@@ -225,11 +356,19 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
                 "title": "Tail dead space (auto-detected)",
             })
 
+    # Guarantee the timeline is a gapless partition of [0, duration]: snap the first
+    # segment to 0 and the last to the full duration, so a sub-second head/tail sliver
+    # below the dead-space-marker threshold isn't left as an uncovered gap that the
+    # Editor silently drops when trimming (only listed segments are kept).
+    if segments:
+        segments[0]["segment_start"] = 0
+        segments[-1]["segment_end"] = round(prop.duration, 2)
+
     out = {
         "video": stem,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "auto_detected": True,
-        "content_segmented": content_segments is not None,
+        "content_segmented": bool(content_segments),
         "trim_status": prop.status,
         "duration": round(prop.duration, 2),
         "kept_pct": round(prop.kept_pct, 1),
@@ -313,7 +452,6 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
                 apply_trim(str(local_video_path), str(trimmed_path), seg["start"], seg["end"])
             else:
                 # Multiple segments — cut each then concatenate
-                import subprocess
                 clip_paths = []
                 for i, seg in enumerate(keep_segments):
                     clip_path = temp_dir / f"clip_{i:03d}.mp4"
@@ -327,17 +465,28 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
                     for cp in clip_paths:
                         f.write(f"file '{cp}'\n")
 
-                # Concatenate
-                log.info(f"Concatenating {len(clip_paths)} clips...")
+                # Concatenate with a RE-ENCODE (not -c copy). The clips are already
+                # re-encoded with identical settings, but concatenating with -c copy can
+                # still glitch at boundaries (timestamp/GOP discontinuities); re-encoding
+                # the joined stream guarantees clean cuts. -c:a aac is a no-op when the
+                # source has no audio (silent clips), so this also handles no-audio video.
+                log.info(f"Concatenating {len(clip_paths)} clips (re-encode)...")
                 subprocess.run(
                     ["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0",
-                     "-i", str(concat_file), "-c", "copy", str(trimmed_path)],
+                     "-i", str(concat_file),
+                     "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                     "-c:a", "aac", "-b:a", "128k",
+                     str(trimmed_path)],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL, check=True,
                 )
 
-            # Upload trimmed video
-            output_key = f"edit/{video_name}_trimmed.mp4"
+            # Prefer the explicit output_key from the frontend: the trimmed object
+            # is named by the trimmed Video row's permanent id (edit/<id>.mp4), so
+            # it's decoupled from any display name and stable across renames. Fall
+            # back to the legacy sanitized-name path for older requests.
+            output_key = trim_data.get("output_key") or \
+                f"edit/{safe_output_name(trim_data.get('output_name'), video_name)}"
             log.info(f"Uploading trimmed video to s3://{s3_bucket}/{output_key}")
             s3_client.upload_file(str(trimmed_path), s3_bucket, output_key)
 
@@ -386,26 +535,48 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             stage2_start = time.time()
             content_segments, taxonomy, transcript_turns = None, None, None
 
-            if _should_run_content_segmentation() and prop.status == "OK" and prop.kept > 0:
+            # Segmentation is decoupled from the dead-space VERDICT: a NEEDS_REVIEW trim
+            # (odd leader, short clip, over-eager detectors) should still yield a
+            # segmented timeline, not one big block. When the trim is OK we segment the
+            # trusted content window; otherwise we segment the WHOLE file and emit no
+            # head/tail dead-space markers, since we didn't trust the trim. `seg_prop`
+            # drives BOTH the segmentation window and the head/tail markers so they can
+            # never disagree; for the OK case it is `prop` itself (no behaviour change).
+            seg_prop = (prop if prop.status == "OK" and prop.kept > 0
+                        else replace(prop, content_start=0.0, content_end=prop.duration))
+
+            if _should_run_content_segmentation() and seg_prop.kept > 0:
+                if prop.status != "OK":
+                    log.info(f"Trim status={prop.status}; segmenting whole file "
+                             f"0->{prop.duration:.1f}s (no auto dead-space markers)")
                 log.info("Running audio-visual fusion segmentation...")
                 try:
                     content_segments, taxonomy, transcript_turns = run_fusion_segmentation(
-                        local_video_path, s3_bucket, s3_key, prop)
+                        local_video_path, s3_bucket, s3_key, seg_prop)
                     log.info(f"Fusion segmentation complete: {len(content_segments)} segments "
                              f"in {time.time() - stage2_start:.2f}s")
                     for s in content_segments:
                         log.info(f"  [{s['start']:.2f}s -> {s['end']:.2f}s] "
                                  f"{s['label']} ({s.get('name', '')})")
                 except Exception as e:
-                    # Never fail the whole run: the Editor still gets the
-                    # dead-space timeline if the fusion stage breaks.
-                    log.warning(f"Fusion segmentation failed (falling back to dead-space only): {e}")
-                    log.warning(traceback.format_exc())
-                    content_segments, taxonomy, transcript_turns = None, None, None
+                    # No usable audio (silent clip / no audio stream / Transcribe
+                    # failed) or a broken fusion stage: fall back to VISUAL shot
+                    # segmentation so the video is still segmented instead of one
+                    # big block. Only if THAT fails too do we drop to dead-space only.
+                    log.warning(f"Fusion segmentation unavailable ({e}); trying visual shot segmentation")
+                    try:
+                        content_segments = run_visual_segmentation(local_video_path, seg_prop)
+                        taxonomy, transcript_turns = None, None
+                        log.info(f"Visual shot segmentation: {len(content_segments)} shots "
+                                 f"in {time.time() - stage2_start:.2f}s")
+                    except Exception as e2:
+                        log.warning(f"Visual segmentation also failed (falling back to dead-space only): {e2}")
+                        log.warning(traceback.format_exc())
+                        content_segments, taxonomy, transcript_turns = None, None, None
             elif not _should_run_content_segmentation():
                 log.info("Content segmentation disabled (CONTENT_SEGMENT=off)")
             else:
-                log.info("Skipping content segmentation (trim status not OK or no content)")
+                log.info("Skipping content segmentation (empty content span)")
 
             # --- STAGE 3: WRITE SEGMENTS ---
             stage3_start = time.time()
@@ -414,8 +585,10 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             if prop.status == "NEEDS_REVIEW":
                 write_review_marker(s3_client, s3_bucket, s3_key, prop)
 
-            # Always write segment JSON so the Editor can display it
-            seg_json = build_segment_json(s3_key, prop, content_segments, taxonomy,
+            # Always write segment JSON so the Editor can display it. Use `seg_prop`
+            # (not `prop`) so the head/tail dead-space markers match the window the
+            # segments were actually computed over.
+            seg_json = build_segment_json(s3_key, seg_prop, content_segments, taxonomy,
                                           transcript_turns)
             log.info(f"Uploading segment JSON to s3://{s3_bucket}/{seg_s3_key}")
             s3_client.put_object(
