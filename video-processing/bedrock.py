@@ -1,23 +1,19 @@
-"""Shared Amazon Bedrock Claude client for the whole segmentation pipeline.
+"""Shared Amazon Bedrock Claude client for the segmentation pipeline.
 
-Every model call -- the VLM frame classification (segment_content / segment_shots)
-AND the transcript labeling (segment_label) -- goes through Bedrock so it reuses
-the project's AWS credentials (the same `.env` transcribe.py uses) instead of a
-separate ANTHROPIC_API_KEY.
+Uses AnthropicBedrock which authenticates via the ECS task role (IAM) — no API
+key needed. The model ID uses the `us.` cross-region inference profile prefix.
 
-Account note (337513903342, us-east-1): only Haiku 4.5 is currently enabled in
-Bedrock -- `us.anthropic.claude-opus-4-8` / `claude-sonnet-5` return 403
-"not available for this account". The id also NEEDS the `us.` cross-region
-inference-profile prefix; the bare `anthropic.claude-haiku-4-5-...` returns 400.
-Request Bedrock model access for a stronger model and bump BEDROCK_MODEL if the
-vision labels are weak.
+Account 337513903342, us-east-1. Current active model: Claude Sonnet 4.6.
+Override via CLAUDE_MODEL env var if a newer model becomes available.
 
-Run with the same AWS env as transcribe.py:
+For local dev, set AWS credentials:
     export AWS_SHARED_CREDENTIALS_FILE=../.env AWS_PROFILE=337513903342_PowerUserAccess
 """
 
-BEDROCK_REGION = "us-east-1"
-BEDROCK_MODEL = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+import os
+
+BEDROCK_REGION = os.environ.get("AWS_REGION", "us-east-1")
+BEDROCK_MODEL = os.environ.get("CLAUDE_MODEL", "us.anthropic.claude-sonnet-4-6")
 
 
 def make_client(region: str = BEDROCK_REGION):

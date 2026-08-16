@@ -1,520 +1,235 @@
-# Automatic Highlight Reel Generator
+# SCUA Video Segment Detector
 
-| Index                                         | Description                                                                        |
-|:----------------------------------------------|:-----------------------------------------------------------------------------------|
-| [Overview](#overview)                         | See the motivation behind this project.                                            |
-| [Description](#description)                   | Learn more about the problem, the implemented solution, and the technologies used. |
-| [Deployment Guide](#deployment)               | How to install and deploy the highlight generator.                                 |
-| [How to Use](#how-to-use)                     | Instructions to use the highlight generator.                                       |
-| [Algorithm](#algorithm)                       | An explanation of the three-stage video processing pipeline.                       |
-| [Lessons Learned](#lessons-learned)           | Limitations and lessons learned.                                                   |
-| [Performance and Cost](#performance-and-cost) | A guide to performance and costs for different instances.                          |
-| [Credits](#credits)                           | Meet the team behind this project.                                                 |
-| [License](#license)                           | License details.                                                                   |
-| [Disclaimers](#Disclaimers)                   | Disclaimers information.                                                           
+Automated dead-space detection and content labeling for archival video collections. Built for the Vanderbilt Special Collections and University Archives (SCUA) to accelerate the processing of digitized VHS tapes and other archival recordings.
+
+| Section | Description |
+|:--------|:------------|
+| [Overview](#overview) | What this system does and why |
+| [Pipeline](#pipeline) | The 4-stage processing pipeline |
+| [Architecture](#architecture) | AWS infrastructure and data flow |
+| [Deployment](#deployment) | How to deploy the backend |
+| [Configuration](#configuration) | Environment variables and tuning |
+| [S3 Layout](#s3-layout) | Bucket prefix conventions |
+| [Cost](#cost) | Per-video processing cost |
+| [Frontend Integration](#frontend-integration) | How the SCUA Editor consumes results |
+| [Credits](#credits) | Team and acknowledgments |
+| [License](#license) | MIT License |
 
 ---
 
 ## Overview
 
-The Automatic Highlight Reel Generator is a computer vision application that uses modern AI techniques to analyze long video recordings of sporting events and automatically extract key moments. This project originated from a challenge presented by the University of Pittsburgh’s diving team. Coaches and athletes were spending hours manually reviewing practice footage where the actual dives constituted only about 20% of the recording. To address this, we developed a solution that provides immense value by automating this tedious process, allowing for more efficient and focused review of important repetitions.
+Archival video collections — digitized VHS tapes, legacy recordings, institutional footage — arrive as raw files that may contain hours of mixed content separated by dead space (black frames, color bars, static/snow, white frames, or silence). Before these videos can be cataloged, discovered, or cited, an archivist must identify where content begins and ends, and describe what each segment contains.
 
-While initially designed for diving, our solution uses a powerful Vision Language Model (VLM) that can detect events based on natural language prompts, making it adaptable to a wide variety of sports and actions.
+This system automates that process:
+
+1. **Detects dead space throughout the entire video** — not just at the head and tail, but internal gaps where recording stopped and restarted (black, white, bars, snow, freeze+silence).
+2. **Transcribes the audio** with speaker diarization (AWS Transcribe), producing word-level timestamps.
+3. **Labels each content span** with a short description using Claude Sonnet 4.6 via Amazon Bedrock (frame + transcript context).
+4. **Writes structured segment JSON** that the SCUA Editor UI displays on an interactive timeline for archivist review and correction.
+
+No GPU required. The pipeline runs on CPU-only ECS tasks (c5.xlarge), with AI classification offloaded to Amazon Bedrock (Claude). Authentication is via the ECS task role — no API keys to manage.
 
 ---
 
-## Description
+## Pipeline
 
-This project aims to address the challenge of manually reviewing lengthy video footage by creating an automated, event-driven pipeline on AWS. When a user uploads a video, a process is triggered that analyzes the footage and identifies frames matching a specific prompt (e.g., “Is there a person in the air jumping into the water?”). The timestamps of these positively identified frames are then grouped together to create distinct time intervals for each event. These intervals are used to clip the original video, and the resulting clips are merged to generate a concise highlight reel.
+When a video is uploaded to S3 (`video/` prefix), the system automatically processes it through 4 stages:
 
-### Problem
+### Stage 1: Full-Video Dead-Space Detection
 
-Coaches, athletes, and staff in many sports record long practice or game sessions for later review. These recordings can often exceed an hour, with the actual relevant action making up only a small percentage of the total runtime. The manual effort required to find and clip these key moments is time-consuming and inefficient. In the case of Pitt’s diving team, training sessions were being recorded and displayed on a 30-second delay for immediate, in-practice feedback. However, this footage was then discarded, preventing any further comprehensive review or long-term analysis by coaches and athletes. An automated system can reduce review time significantly, allowing for more focused and productive analysis.
+Uses ffmpeg and OpenCV to probe the entire video for dead regions:
 
-### Initial Challenges
+| Detector | Signal | Method |
+|----------|--------|--------|
+| Black frames | Near-black sustained frames | ffmpeg `blackdetect` |
+| White frames | Near-white sustained frames | ffmpeg `negate` + `blackdetect` |
+| Color bars | SMPTE/EBU test patterns | OpenCV: saturation + vertical band uniformity |
+| Video static (snow) | Tape run-out noise | OpenCV: Laplacian variance + frame-to-frame MAD |
+| Freeze frames | Unchanging video (supporting signal) | ffmpeg `freezedetect` |
+| Silence | Near-silent audio (supporting signal) | ffmpeg `silencedetect` |
 
-- **Event Boundary Detection:** A key challenge was determining the precise start and end of a dynamic action, like a dive, from a single frame where the event was detected. We needed a reliable way to create a clip that captured the entire motion.
-- **Model Optimization:** For this application, missing a key event (a false negative) is far more detrimental than incorrectly identifying a non-event (a false positive). Therefore, we had to prioritize the model's recall to ensure no important repetitions were lost.
-- **Extreme Environmental Variability:** The solution needed to be robust enough to function across different venues and camera setups. In some cases, key elements like the 10-meter diving platform were completely out of frame, meaning the only visible action was the diver already in mid-air. This made it impossible to rely on detecting the athlete's initial jump.
+Dead regions are merged (bridging gaps < 2s) and filtered (minimum 3s duration). Only regions anchored by black, white, bars, or snow qualify as dead spans — freeze and silence alone are not sufficient (they catch static camera shots in real program otherwise).
 
-### Our Approach
+Output: alternating dead spans + content spans covering the full video duration.
 
-- **Falling Motion Detection:** Because the initial jump was often invisible, we couldn't use complex methods like pose estimation to detect a "leaping" action. Our approach therefore focused on detecting the most reliable and consistently visible part of the event: the downward motion of the diver falling toward the water.
-- **Leveraging Pre-trained Models:** To ensure robustness and enable rapid iteration, we opted to use powerful, pre-trained Vision-Language Models (VLMs). This strategy bypassed the time-intensive process of data collection, labeling, and custom model training, preventing overfitting and providing a foundation that could be generalized to other sports.
-- **Dynamic Interval Creation:** We developed a dynamic pipeline to define event boundaries from the model's raw output. This process first filters the frame-by-frame predictions by a confidence threshold to retain only high-certainty detections. These positive frames are clustered based on their timestamps to isolate distinct events and filter out sporadic, noisy predictions. Finally, a continuous time interval is generated around each cluster—with a small buffer added to the start and end—to ensure the entire action is captured.
+### Stage 2: Transcription (Cached)
 
-### Architecture Diagram
+AWS Transcribe reads the video directly from S3 (no re-upload) with speaker diarization enabled. Returns word-level timestamps grouped into speaker turns.
 
-![HighlightProcessorDiagram2.png](/public/HighlightProcessorDiagram.png)
+The transcript is **cached** to `transcript/{name}.json` and `transcript/{name}.vtt` (WebVTT for Aviary). On re-segmentation runs, the cached transcript is reused — Transcribe is not re-run.
 
-### Functionality
+### Stage 3: Content Labeling (Claude Sonnet 4.6 via Bedrock)
 
-Our project utilizes AWS to implement an event-driven pipeline that automatically runs a containerized processing job on Amazon ECS when a file is uploaded to an S3 bucket.
+For each content span between dead gaps:
+- Samples a frame from the midpoint
+- Includes a transcript excerpt for context
+- Asks Claude to describe the segment and provide a short title via Amazon Bedrock
+- ~1 API call per content span (~$0.06 per hour of video)
+- Authenticates via ECS task role (IAM) — no API key needed
 
-The end-to-end workflow is designed as follows:
+Graceful fallback: if labeling fails, content spans are still output with their transcripts but without AI-generated titles.
 
-- **Trigger**: A user uploads a video file to a designated `videos/` prefix in an S3 bucket.
-- **Orchestration**: The S3 upload event triggers an AWS Lambda function.
-- **Task Execution**: The Lambda function launches a task on an Amazon ECS cluster using the EC2 launch type. This task runs a Docker container on a GPU-enabled EC2 instance to perform the video analysis.
-- **Processing**: Inside the container, a Python script orchestrates a multi-stage process to downsample the video, run inference with the Pali-Gemma model to find events, and create clips.
-- **Output**: The final highlight reel is uploaded to a `results/` prefix in the same S3 bucket.
+### Stage 4: Write Segment JSON
 
-### Technologies
+Writes `segment/{name}.json` to S3 with alternating D (dead) and C/I (content) segments:
 
-**Amazon Web Services:**
+```json
+{
+  "video": "RCC_183",
+  "duration": 1847.5,
+  "dead_span_count": 3,
+  "content_span_count": 2,
+  "segments": [
+    {"segment_start": 0, "segment_end": 45.2, "segment_type": "D", "title": "Dead space (bars)"},
+    {"segment_start": 45.2, "segment_end": 892.1, "segment_type": "C", "title": "Campus tour interview",
+     "transcript": "Welcome to the archives today...", "description": "Two people walking..."},
+    {"segment_start": 892.1, "segment_end": 904.8, "segment_type": "D", "title": "Dead space (black)"},
+    {"segment_start": 904.8, "segment_end": 1802.3, "segment_type": "C", "title": "Lecture recording",
+     "transcript": "Good afternoon everyone...", "description": "A speaker at a podium..."},
+    {"segment_start": 1802.3, "segment_end": 1847.5, "segment_type": "D", "title": "Dead space (snow)"}
+  ]
+}
+```
 
-- Amazon S3
-- AWS Lambda
-- Amazon ECS
-- Amazon EC2 (for GPU-enabled instances)
-- Amazon SageMaker (for rapid prototyping and model testing)
-- AWS CDK (for infrastructure)
-
-**Software and Machine Learning:**
-
-- Python
-- Docker
-- Hugging Face (for model hosting)
-- Pali-Gemma-2
-- PyTorch
-- FFmpeg
 ---
+
+## Architecture
+
+```
+Upload video to S3 (video/*.mp4)
+  → [S3 event notification]
+  → Lambda (validates file, launches ECS task)
+  → ECS Task (c5.xlarge, CPU-only):
+      1. ffmpeg + OpenCV dead-space probe (full video)
+      2. AWS Transcribe (reads from S3, cached)
+      3. Claude Sonnet 4.6 labeling via Bedrock (1 call per content span)
+      4. Write segment JSON + transcript JSON/VTT to S3
+  → SCUA Editor UI (React/Amplify) reads segment/{id}.json
+  → Archivist reviews, edits, approves
+  → [Optional] Trim request → ECS task (MODE=trim) → trimmed .mp4
+```
+
+Infrastructure (CDK):
+- **VPC** with NAT gateway (ECS tasks need internet for Transcribe + Bedrock)
+- **ECS Cluster** with Auto Scaling Group (c5.xlarge, min 0 / max 2)
+- **Lambda** trigger on S3 `video/*` uploads and `edit/*_trim_request.json`
+- **IAM roles** with Bedrock InvokeModel + Marketplace permissions
+- **Custom resources** for S3 notification config + bucket lifecycle
+
+---
+
 ## Deployment
-
-This section provides a complete guide for deploying the Automatic Highlight Reel Generator on AWS.
 
 ### Prerequisites
 
-Before deploying this solution, ensure you have:
+1. AWS account with CDK bootstrapped
+2. AWS CLI configured with a profile (e.g., `scua-vcil`)
+3. Node.js 18+ and npm
+4. Docker running locally (for building the ECS container image)
+5. Claude Sonnet 4.6 enabled in Amazon Bedrock (Console → Bedrock → Model access)
 
-1. **AWS Account**: An active AWS account with appropriate permissions to create resources
-2. **AWS Service Quota Increase:** This project uses a `g4dn.2xlarge` EC2 instance, which has 8 vCPUs. By default, many AWS accounts have a vCPU quota of 0 or 4 for "Running On-Demand G and VT instances." You must request a service quota increase before deployment.
-   - Navigate to the Service Quotas console in your AWS account.
-   - Select **Amazon Elastic Compute Cloud (Amazon EC2)**.
-   - Search for the quota named `Running On-Demand G and VT instances`.
-   - Request a quota increase to a value of at least **8**, or request 12 or 16 for flexibility.
-   - **Note:** Quota increases are not instantaneous and may take some time for AWS to approve. It is best to do this step first.
-4. **AWS CLI**: Installed and configured with credentials (`aws configure`)
-5. **Node.js and npm**: Version 14.x or higher for CDK
-6. **AWS CDK**: Install globally with `npm install -g aws-cdk`
-7. **Docker**: Installed and running on your local machine
-8. **Hugging Face Account**: Required to access the Pali-Gemma model
-   - Create an account at [Hugging Face](https://huggingface.co)
-   - Generate an access token from your account settings
-   - Accept the Pali-Gemma model license agreement
-
-### Step 1: Clone and Setup the Project
+### Deploy
 
 ```bash
-# Clone the repository
-git clone 
-cd highlight-processor
-
-# Install CDK dependencies
+cd automatic-highlight-reel-generator
 npm install
-
-# Build the TypeScript CDK code
-npm run build
+cdk deploy \
+  --parameters AmplifyBucketName=<your-amplify-bucket-name> \
+  --profile scua-video
 ```
 
-### Step 2: Configure Environment Variables
-
-```bash
-export HUGGINGFACE_TOKEN='your_huggingface_token_here'
-```
-
-### Step 3: Build the Docker Container
-
-The container includes all dependencies and the pre-downloaded Pali-Gemma model:
-
-```bash
-cd video-processing
-
-# Build the Docker image with your Hugging Face token
-docker build --build-arg HUGGINGFACE_TOKEN=$HUGGINGFACE_TOKEN -t highlight-processor .
-
-# This process will:
-# - Install CUDA libraries and FFmpeg
-# - Install all Python dependencies
-# - Download and cache the Pali-Gemma model (~6GB)
-# Note: This may take 15-30 minutes on first build
-
-cd ..
-```
-
-### Step 4: Bootstrap CDK (First-time only)
-
-If this is your first time using CDK in this AWS account/region:
-
-```bash
-cdk bootstrap aws://$AWS_ACCOUNT_ID/$AWS_DEFAULT_REGION
-```
-
-### Step 5: Deploy the Infrastructure
-
-```bash
-# Preview the resources that will be created
-cdk diff
-
-# Deploy the stack
-cdk deploy
-
-# You'll be prompted to approve security-related changes
-# Type 'y' to proceed
-```
-
-The deployment will create:
-- VPC with public/private subnets
-- ECS Cluster with EC2 capacity (g4dn.2xlarge GPU instances)
-- S3 bucket for video storage
-- Lambda function for orchestration
-- IAM roles and policies
-- CloudWatch log groups
-
-### Step 6: Note the Outputs
-
-After successful deployment, CDK will display outputs similar to:
-
-```
-Outputs:
-HighlightProcessorStack.VideoBucketName = highlight-processor-videos-xxxxx
-HighlightProcessorStack.LogGroupName = /ecs/video-processor
-HighlightProcessorStack.ClusterName = HighlightProcessorCluster
-```
----
-
-## How to Use
-
-You can interact with the highlight reel generator in two ways: through the command line for direct AWS interaction, or by using the local Streamlit UI for a user-friendly experience.
-
-### Option 1: Using the AWS CLI
-
-This method is suitable for developers and users comfortable with the AWS Command Line Interface.
-
-**Step 1: Get the S3 Bucket Name**
-
-After a successful deployment, the CDK outputs the name of the S3 bucket created for video uploads. You can retrieve this bucket name from the CloudFormation stack outputs.
-
-```bash
-# Command to get the bucket name
-BUCKET_NAME=$(aws cloudformation describe-stacks --stack-name HighlightProcessorStack --query 'Stacks[0].Outputs[?         OutputKey==`BucketName`].OutputValue' --output text)
-
-# You can then echo the variable to see the bucket name
-echo $BUCKET_NAME
-```
-
-This will return the bucket name, which will look something like this:
-`video-uploads--us-east-1-highlightprocessorstack`
-
-**Step 2: Upload a Video**
-
-Upload your video file to the `videos/` prefix in the S3 bucket.
-
-```bash
-# Using the BUCKET_NAME variable from the previous step
-aws s3 cp your-video.mp4 s3://$BUCKET_NAME/videos/
-```
-
-The pipeline supports any video format compatible with FFmpeg, such as MP4, MOV, and AVI.
-
-**Step 3: Monitor the Pipeline**
-
-The pipeline is triggered automatically when a new video is uploaded to the S3 bucket. You can monitor the two main stages of the pipeline through CloudWatch Logs:
-
-1.  **Lambda Trigger**: This function is triggered by the S3 upload and starts the ECS task.
-
-    ```bash
-    # Tail the logs for the Lambda function
-    aws logs tail /aws/lambda/HighlightProcessorStack-VideoTriggerLambda --follow
-
-    # --- Expected Outputs ---
-    # The Lambda logs will show the function starting, processing the S3 event,
-    # and successfully launching the ECS task.
-    [INFO] Lambda triggered. Event: {"Records": [{"s3": {"object": {"key": "videos/your-video.mp4"}}}]}
-    [INFO] Processing file: s3://video-uploads--us-east-1-highlightprocessorstack/videos/your-video.mp4
-    [INFO] Started ECS task: arn:aws:ecs:us-east-1::task/video-processor-cluster-HighlightProcessorStack/...
-    ```
-
-2.  **ECS Task Processing**: This is where the main video processing happens. The log group is named after your CDK stack.
-
-    ```bash
-    # Tail the logs for the ECS task
-    aws logs tail /ecs/video-processor-HighlightProcessorStack --follow
-
-    # --- Expected Outputs ---
-    # The ECS logs show the detailed progress of the video processing pipeline,
-    # from downsampling and inference to the final clipping and merging.
-    [INFO] === Video Highlight Processor Starting ===
-    [INFO] Processing s3://<bucket_name>/videos/your-video.mp4
-
-    [INFO] --- Stage 1 (Downsampling) completed in 3.07s ---
-    [INFO] Starting downsampling for '1min_dive' to 4 FPS...
-    [INFO] Downsampled video saved to: /tmp/tmphbi7ri49/4fps.mp4
-
-    [INFO] --- Stage 2 (Inference) completed in 25.43s ---
-    [INFO] Loading model 'google/paligemma2-3b-mix-224' to device 'cuda'...
-    [INFO] Running Inference: 100%|██████████| 171/171 [00:15<00:00, 10.90frame/s]
-    [INFO] Saved 3 predicted intervals to: /tmp/tmphbi7ri49/predicted_intervals.csv
-
-    [INFO] --- Stage 3 (Clipping & Merging) completed in 3.55s ---
-    [INFO] Extracting clip 1/3: 9.43s to 17.40s -> 1min_dive_clip_001.mp4
-    [INFO] Merging 3 clips into highlights.mp4...
-
-    [INFO] Uploading final highlight video to s3://<bucket_name>/results/highlights.mp4
-    [INFO] === Video Highlight Processor Finished Successfully in 33.76s ===
-    ```
-
-
-
-**Step 4: Download the Highlight Reel**
-
-Once the processing is complete, the final highlight reel will be available in the `results/` prefix of your S3 bucket.
-
-```bash
-# List the results in the bucket
-aws s3 ls s3://$BUCKET_NAME/results/
-
-# Download the highlight reel
-aws s3 cp s3://$BUCKET_NAME/results/your-video_highlights.mp4 ./
-```
-
-### Option 2: Using the Frontend UI
-
-The Streamlit UI provides a graphical interface to upload videos, track processing, and download results without needing to use the AWS CLI for every step.
-
-**Step 1: Setup and Run the UI**
-
-Before using the UI, you need to install its dependencies and run the Streamlit app.
-
-```bash
-# Navigate to the frontend directory
-cd frontend/
-
-# Create a Python virtual environment
-python3 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Run the Streamlit app
-streamlit run ui/app.py
-```
-
-This will open the application in your web browser.
-
-**Step 2: Configure Settings**
-
-1.  Open the sidebar in the Streamlit app.
-2.  Enter your **S3 Bucket**, **AWS Region**, and the **Stack name** (default is `HighlightProcessorStack`).
-3.  If you don't know the bucket name, the app can try to discover it from your CloudFormation stack outputs.
-4.  Click **"Save settings"** to store your configuration for future use.
-
-**Step 3: Upload and Process a Video**
-
-You have several options for uploading your video file:
-
-  * **Quick upload:** Drag and drop a smaller video directly into the browser.
-  * **Large upload (recommended for big files):**
-      * **Local file path:** Provide the absolute path to a video on your computer. The app will handle the upload efficiently using multipart uploading.
-      * **Existing S3 object:** Provide the `s3://bucket/key` URI of a video already in S3 to copy it to the correct input location without re-uploading.
-
-After selecting your video, you can optionally customize the prompt used for event detection. Click **"Start upload & process"** to begin.
-
-**Step 4: Monitor and Download**
-
-The UI will display the progress of the upload and the subsequent processing stages by monitoring CloudWatch logs in real-time:
-
-  - Lambda trigger received
-  - ECS task started
-  - Stage 1: Downsampling
-  - Stage 2: Inference
-  - Stage 3: Clipping & Merging
-  - Finished successfully
-
-Once complete, a preview of the highlight reel will appear. You can then download the final video directly from the UI.
-
-
-### Custom Configuration with `config.yaml`
-
-The `video-processing/config.yaml` file allows for detailed customization of the video processing pipeline. You can modify this file to fine-tune the behavior of each stage.
-
-**Key Configuration Options:**
-
-  * **`main`**:
-      * `default_prompt`: Change the default natural language prompt for event detection.
-      * `s3_output_prefix`: Specify the S3 folder for the final highlight videos.
-  * **`downsampling`**:
-      * `target_fps`: Adjust the frames-per-second for faster processing. A lower value (e.g., 2-4) is recommended.
-  * **`inference`**:
-      * `model_id`: Change the Vision Language Model from Hugging Face.
-      * `batch_size`: Adjust the number of frames processed in a single batch to fit your GPU's VRAM.
-      * `crop_width_start` and `crop_width_end`: Define a horizontal region of interest to focus the analysis.
-  * **`post_processing`**:
-      * `confidence_threshold`: Set the minimum confidence score for a "yes" prediction.
-      * `grouping_threshold_sec`: Group nearby detections into a single event.
-      * `buffer_start_sec` and `buffer_end_sec`: Add extra time to the beginning and end of each clip.
-      * `merge_gap_sec`: Merge event intervals that are close to each other.
-  * **`clipping`**:
-      * `ffmpeg_preset`: Control the trade-off between encoding quality and speed.
-      * `crf_value`: Adjust the video quality of the final clips (lower is better quality).
-      * `audio_bitrate`: Set the audio bitrate for the final video.
-
-> **Note:** After modifying `config.yaml`, Redeploy the CDK stack for the changes to take effect. **A workaround for this will be added in future commits.**
----
-
-## Algorithm
-
-The core of this project is a three-stage pipeline orchestrated by a monolithic Python script running inside a Docker container.
-
-### Stage 1: Downsampling and Timestamp Generation
-
-To make the analysis efficient, the original high-resolution video is first downsampled to a lower frame rate (e.g., 4 FPS). A critical step here is the creation of a timestamp mapping file (CSV), which links every frame of the downsampled video back to the precise timestamp in the original video. This ensures the final clips are cut from the high-quality source.
-
-### Stage 2: Event Detection and Interval Creation
-
-This is the main event detection stage.
-
-1. **Run Inference**: The downsampled video is processed frame-by-frame using the **Pali-Gemma** vision-language model. For each frame, the model is given a prompt (e.g., “Is there a person in the air jumping into the water?”) and returns a “yes” or “no” answer with a confidence score.
-2. **Post-Process**: The raw predictions are filtered to remove low-confidence and isolated detections. Consecutive “yes” frames are then grouped into events. A time buffer is added to each event to ensure the full action is captured, and any overlapping intervals are merged.
-3. **Save Intervals**: The final output is a CSV file containing the `start` and `end` timestamps for each highlight-worthy event.
-
-### Stage 3: Clipping and Merging
-
-In the final stage, the system uses the predicted intervals from Stage 2 to create the highlight reel.
-
-1. **Extract Clips**: Using the `ffmpeg` library, the script iterates through the intervals CSV. For each `start` and `end` time, it extracts that exact segment from the **original, high-resolution video**.
-2. **Merge Clips**: After all individual clips are extracted, `ffmpeg` is used again to concatenate them in chronological order into a single, seamless video file.
-3. **Upload Final Video**: This final merged video is the end product, which is then uploaded to S3.
+Find the bucket name in `amplify_outputs.json` → `storage.bucket_name` in the SCUA-Video-Editing project.
+
+### What Gets Created
+
+- VPC (2 AZs, 1 NAT gateway)
+- ECS cluster + c5.xlarge ASG (scales to 0 when idle)
+- Docker image built from `video-processing/` and pushed to ECR
+- Lambda trigger for S3 events
+- IAM roles (task role: S3 + Transcribe; execution role: ECR + Secrets Manager)
+- CloudWatch log group (`/ecs/scua-video-processor`)
+- S3 notification config on the Amplify bucket
+- Bucket lifecycle rule (noncurrent version cleanup)
 
 ---
 
-## Lessons Learned
+## Configuration
 
-> To be updated
+Environment variables set on the ECS container (configurable in the CDK stack):
 
----
-
-## Performance and Cost
-This section provides cost and performance estimates for deploying and running the Automatic Highlight Reel Generator on AWS.
-
-*Note: These figures are estimates based on usage in the `us-east-1` (N. Virginia) region. Actual costs and processing times may vary based on video characteristics, system load, and AWS pricing changes.*
-
-### AWS Service Cost Breakdown
-
-The total cost of this pipeline is a sum of the costs of the individual AWS services used. Here's a breakdown of each component:
-
-| Service | Cost Driver | Estimated Cost |
-| :--- | :--- | :--- |
-| **Amazon EC2** | `g4dn.2xlarge` instance for processing | ~$0.752 per hour |
-| **Amazon S3** | Video storage and requests | ~$0.023 per GB/month |
-| **Amazon ECR**| Container image storage | ~$0.10 per GB/month |
-| **NAT Gateway** | Hourly fee and data processing | ~$0.045 per hour + ~$0.045 per GB |
-| **AWS Secrets Manager** | Storing the Hugging Face token | ~$0.40 per secret/month |
-| **Data Transfer**| Outbound to internet (e.g., downloading results) | ~$0.09 per GB |
-| **Orchestration & Monitoring** | Lambda, CloudWatch Logs, Metrics, and Alarms | < $0.01 per video (typically within Free Tier) |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CONTENT_SEGMENT` | `auto` | `auto` = label if API key present; `off` = dead-space only |
+| `TRIM_MODE` | `black` | `black` (conservative) or `static` (aggressive) |
+| `MERGE_GAP` | `2.0` | Bridge dead regions closer than this (seconds) |
+| `MIN_DEAD_DUR` | `3.0` | Minimum duration for a dead span (seconds) |
+| `MIN_CONTENT_DUR` | `5.0` | Content spans shorter than this get absorbed |
+| `TRANSCRIBE_LANGUAGE` | `en-US` | AWS Transcribe language code |
+| `MAX_SPEAKERS` | `10` | Max speakers for diarization |
+| `MAX_FRAME_WIDTH` | `768` | Downscale frames to this width before sending to Claude |
+| `CLAUDE_MODEL` | `us.anthropic.claude-sonnet-4-6` | Bedrock model ID for content labeling |
 
 ---
 
-### Monthly and Per-Video Cost Estimation
+## S3 Layout
 
-You can think of the total cost in two parts: a fixed monthly "floor" cost to keep the service ready, and a variable cost for each video you process.
+All paths are within the Amplify-managed bucket:
 
-#### 1. Monthly Floor Cost (Infrastructure)
-This is the baseline cost to have the infrastructure deployed and ready.
-| Service | Usage | Estimated Monthly Cost |
-| :--- | :--- | :--- |
-| **Amazon ECR** | ~6 GB container image storage | ~$0.60 |
-| **NAT Gateway** | Idle gateway running 24/7 (if not scaled down) | ~$32.40 |
-| **Total Estimated Floor Cost**| | **~$33.40/month** |
-
-#### 2. Cost Per Video Run
-This is the additional cost incurred each time a video is processed. The example below is for a **2-hour video (~10 GB)**.
-
-| Service | Usage (per video) | Estimated Cost |
-| :--- | :--- | :--- |
-| **Amazon EC2** | ~1.5 hours of g4dn.2xlarge | ~$1.13 |
-| **Amazon S3**| 20 GB storage (input/output) for one month | ~$0.46 |
-| **NAT Gateway**| ~1.5 hours active + ~6 GB data processing (model download) | ~$0.34 |
-| **Data Transfer** | ~2 GB highlight reel download to the internet | ~$0.18 |
-| **Orchestration & Monitoring**| Negligible (within Free Tier for low volume) | ~$0.00 |
-| **Total Estimated Cost (per video)**| | **~$2.11** |
+| Prefix | Contents | Written by |
+|--------|----------|------------|
+| `video/` | Source video uploads (.mp4) | Frontend (user upload) |
+| `segment/{id}.json` | Segment timeline JSON | Backend (ECS) |
+| `transcript/{id}.json` | Word-level speaker turns (cached) | Backend (ECS) |
+| `transcript/{id}.vtt` | WebVTT for Aviary | Backend (ECS) |
+| `review/{name}.txt` | Review markers for flagged videos | Backend (ECS) |
+| `edit/{name}_trim_request.json` | Trim instructions from Editor | Frontend |
+| `edit/{name}_trimmed.mp4` | Trimmed video output | Backend (ECS, trim mode) |
 
 ---
-### AWS EC2 Instance: g4dn.2xlarge
 
-* **Instance Type:** g4dn.2xlarge
-* **vCPUs:** 8
-* **Memory:** 32 GiB
-* **GPU:** 1x NVIDIA T4
-* **On-Demand Price (us-east-1):** Approximately $0.752 per hour
-* `BATCH_SIZE = 16`
+## Cost
 
-| Video Length (Original) | Processing Time (Total) | Real-Time Speed | Inference Speed (Avg. FPS) | Estimated Cost |
-| :--- | :--- | :--- | :--- | :--- |
-| ~1 minute | ~33 seconds | ~1.3× faster than real-time | ~10.14 FPS | < $0.01 |
-| ~15 minutes | ~10 minutes | ~1.5× faster than real-time | ~8.98 FPS | ~ $0.13 |
-| ~2 hours, 6 minutes | ~90 minutes | ~1.4× faster than real-time | ~8.94 FPS | ~ $1.13 |
+Per 1-hour video:
 
-*Note: "Real-Time Speed" compares the total processing time to the original video’s length (a value greater than 1.0× is faster than real-time). "Inference Speed" measures how quickly the model processes the downsampled video (at 4 FPS).*
+| Stage | Cost | Time |
+|-------|------|------|
+| Dead-space detection (ffmpeg + OpenCV) | ~$0.01 (EC2 time) | 2-5 min |
+| Transcription (AWS Transcribe) | ~$0.72 | 3-5 min |
+| Content labeling (Claude Sonnet 4.6 via Bedrock, ~3 calls) | ~$0.06 | 10-15 sec |
+| **Total** | **~$0.79** | **5-10 min** |
 
-> To be updated with performance and cost data for other GPU-enabled EC2 instance types.
+Re-segmentation (cached transcript): ~$0.07, 2-5 min.
+
+EC2 cost: c5.xlarge at $0.17/hr, scales to 0 when idle. NAT gateway: ~$0.045/hr while tasks run.
+
+---
+
+## Frontend Integration
+
+The SCUA Editor (`Project2/SCUA-Video-Editing`) consumes the backend output:
+
+- Reads `segment/{id}.json` on the Editor page to display the timeline
+- Reads `transcript/{id}.json` to auto-adjust transcript text when segment boundaries are moved
+- Writes `edit/{id}_trim_request.json` when the user clicks "Trim Video"
+- Supports re-segmentation (triggers a fresh ECS run via the same S3 notification path)
+
+The Editor displays:
+- Color-coded timeline with D (dead) and C (content) segments
+- Editable titles, transcripts, and boundaries per segment
+- Skip-player that jumps over deleted segments during playback
+- Download: JSON, VTT, transcript, and video
+
 ---
 
 ## Credits
-**automatic-highlight-reel-generator** is an open source software. The following people have contributed to this project.
 
-**Developers:**  
-- [Roman Koshovnyk](https://www.linkedin.com/in/roman-koshovnyk-452971161/)
-- [Rowan Morse](https://www.linkedin.com/in/rowan-morse/)
+**SCUA Video Segment Detector** is developed by the **Vanderbilt Cloud Innovation Lab** in partnership with the **Vanderbilt Special Collections and University Archives** and **Amazon Web Services**.
 
-This project is designed and developed with guidance and support from the **University of Pittsburgh Cloud Innovation Center** and **Amazon Web Services (AWS)**.
+This project builds on the infrastructure originally created for the [Automatic Highlight Reel Generator](https://github.com/HeardLibrary-VCIL/automatic-highlight-reel-generator) (University of Pittsburgh Cloud Innovation Center).
 
 ---
 
 ## License
 
-
 This project is distributed under the [MIT License](LICENSE).
-
-```
-MIT License
-
-Copyright (c) 2025 University of Pittsburgh Health Sciences and Sports Analytics Cloud Innovation Center
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-```
-
-
-## Disclaimers
-
-**Customers are responsible for making their own independent assessment of the information in this document.** 
-
-**This document:**  
-(a) is for informational purposes only,  
-(b) references AWS product offerings and practices, which are subject to change without notice,  
-(c) does not create any commitments or assurances from AWS and its affiliates, suppliers or licensors. AWS products or services are provided "as is" without warranties, representations, or conditions of any kind, whether express or implied. The responsibilities and liabilities of AWS to its customers are controlled by AWS agreements, and this document is not part of, nor does it modify, any agreement between AWS and its customers, and  
-(d) is not to be considered a recommendation or viewpoint of AWS.   
-
-**Additionally, you are solely responsible for testing, security and optimizing all code and assets on GitHub repo, and all such code and assets should be considered:**  
-(a) as-is and without warranties or representations of any kind,  
-(b) not suitable for production environments, or on production or other critical data, and  
-(c) to include shortcuts in order to support rapid prototyping such as, but not limited to, relaxed authentication and authorization and a lack of strict adherence to security best practices.     
-
-**All work produced is open source. More information can be found in the GitHub repo.**

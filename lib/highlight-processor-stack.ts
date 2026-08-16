@@ -7,7 +7,6 @@ import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
-import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
 
@@ -25,16 +24,6 @@ export class HighlightProcessorStack extends cdk.Stack {
 
     // Import the existing Amplify bucket (cross-stack reference)
     const videoBucket = s3.Bucket.fromBucketName(this, 'AmplifyVideoBucket', amplifyBucketName.valueAsString);
-
-    // ═══════════════════════════════════════════════════════════════════════
-    // SECRETS — Anthropic API key for content-type segmentation (Claude vision)
-    // Create in Secrets Manager before deploy:
-    //   aws secretsmanager create-secret --name scua/anthropic-api-key \
-    //     --secret-string "sk-ant-..."
-    // ═══════════════════════════════════════════════════════════════════════
-    const anthropicApiKeySecret = secretsmanager.Secret.fromSecretNameV2(
-      this, 'AnthropicApiKey', 'scua/anthropic-api-key'
-    );
 
     // ═══════════════════════════════════════════════════════════════════════
     // NETWORKING
@@ -107,9 +96,6 @@ export class HighlightProcessorStack extends cdk.Stack {
       ],
     });
 
-    // Allow execution role to pull the Anthropic API key secret at task start
-    anthropicApiKeySecret.grantRead(executionRole);
-
     autoScalingGroup.role.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ['ec2:UseLaunchTemplate'],
@@ -131,15 +117,11 @@ export class HighlightProcessorStack extends cdk.Stack {
         videoBucket.arnForObjects('edit/*'),
         videoBucket.arnForObjects('segment/*'),
         videoBucket.arnForObjects('review/*'),
+        videoBucket.arnForObjects('transcript/*'),
       ],
     }));
 
-    // ── Amazon Transcribe (Stage A of the segmentation pipeline) ──────────────
-    // Transcribe reads the media straight out of the Amplify bucket using THIS
-    // role's S3 permissions (same-account access), so the video never has to be
-    // copied anywhere. With no OutputBucketName the result lands in a
-    // service-managed bucket and comes back as a presigned URL, so no extra
-    // write permission is needed. Job ARNs are minted per run -> resource '*'.
+    // ── Amazon Transcribe (full-video speech-to-text with speaker diarization) ─
     taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: [
@@ -149,11 +131,7 @@ export class HighlightProcessorStack extends cdk.Stack {
       resources: ['*'],
     }));
 
-    // ── Amazon Bedrock (Stages C/D: taxonomy discovery + multimodal labeling) ─
-    // Both the frame classification and the transcript labeling call Claude via
-    // Bedrock, so there is no ANTHROPIC_API_KEY anywhere in the stack. Invoking a
-    // cross-region inference profile (us.anthropic.*) requires permission on BOTH
-    // the profile ARN and the foundation models it routes to.
+    // ── Amazon Bedrock (Claude via cross-region inference profile) ─────────────
     taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['bedrock:InvokeModel'],
@@ -161,6 +139,16 @@ export class HighlightProcessorStack extends cdk.Stack {
         'arn:aws:bedrock:*::foundation-model/anthropic.*',
         `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/*`,
       ],
+    }));
+
+    // Marketplace permissions required for newer Bedrock models (Sonnet 4+)
+    taskRole.addToPrincipalPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        'aws-marketplace:ViewSubscriptions',
+        'aws-marketplace:Subscribe',
+      ],
+      resources: ['*'],
     }));
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -189,19 +177,13 @@ export class HighlightProcessorStack extends cdk.Stack {
       }),
       command: ["python3", "main.py"],
       environment: {
-        // botocore resolves region from AWS_DEFAULT_REGION; set both so every
-        // boto3 client (Transcribe has no global-endpoint fallback) has a region.
         AWS_REGION: this.region,
         AWS_DEFAULT_REGION: this.region,
         // Output paths matching SCUA frontend storage conventions
         RESULT_PREFIX: 'edit',
         SEGMENT_PREFIX: 'segment',
-        // Content-type segmentation settings
-        CONTENT_SEGMENT: 'auto',  // "auto" = run if API key present, "off" = skip
-      },
-      secrets: {
-        // Injected from Secrets Manager at task start — the anthropic SDK reads this automatically
-        ANTHROPIC_API_KEY: ecs.Secret.fromSecretsManager(anthropicApiKeySecret),
+        // Content labeling: "auto" = always on (Bedrock via task role); "off" = dead-space only
+        CONTENT_SEGMENT: 'auto',
       },
       essential: true,
     });
@@ -287,7 +269,7 @@ def handler(event, context):
 
             # Remove any existing notifications with our IDs
             lambda_configs = existing.get('LambdaFunctionConfigurations', [])
-            our_ids = {notification_id, notification_id + '-trim'}
+            our_ids = {notification_id, notification_id + '-trim', notification_id + '-segment'}
             lambda_configs = [c for c in lambda_configs if c.get('Id') not in our_ids]
 
             # Add our notifications
@@ -316,6 +298,19 @@ def handler(event, context):
                     }
                 }
             })
+            lambda_configs.append({
+                'Id': notification_id + '-segment',
+                'LambdaFunctionArn': lambda_arn,
+                'Events': ['s3:ObjectCreated:*'],
+                'Filter': {
+                    'Key': {
+                        'FilterRules': [
+                            {'Name': 'prefix', 'Value': 'edit/'},
+                            {'Name': 'suffix', 'Value': '_segment_request.json'}
+                        ]
+                    }
+                }
+            })
             existing['LambdaFunctionConfigurations'] = lambda_configs
             s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
 
@@ -323,7 +318,7 @@ def handler(event, context):
             existing = s3.get_bucket_notification_configuration(Bucket=bucket)
             existing.pop('ResponseMetadata', None)
             lambda_configs = existing.get('LambdaFunctionConfigurations', [])
-            lambda_configs = [c for c in lambda_configs if c.get('Id') not in (notification_id, notification_id + '-trim')]
+            lambda_configs = [c for c in lambda_configs if c.get('Id') not in (notification_id, notification_id + '-trim', notification_id + '-segment')]
             existing['LambdaFunctionConfigurations'] = lambda_configs
             s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
 
@@ -346,6 +341,87 @@ def handler(event, context):
         BucketName: amplifyBucketName.valueAsString,
         LambdaArn: triggerLambda.functionArn,
         NotificationId: 'scua-video-trim-trigger',
+      },
+    });
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // BUCKET CONFIG — disable versioning + 7-day lifecycle for noncurrent versions
+    // The Amplify bucket has versioning enabled by default. We suspend it and
+    // add a lifecycle rule to expire noncurrent versions after 1 day (cleanup).
+    // ═══════════════════════════════════════════════════════════════════════
+    const bucketConfigHandler = new lambda.Function(this, 'BucketConfigHandler', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.handler',
+      timeout: cdk.Duration.minutes(2),
+      code: lambda.Code.fromInline(`
+import boto3
+import cfnresponse
+import traceback
+
+def handler(event, context):
+    try:
+        s3 = boto3.client('s3')
+        bucket = event['ResourceProperties']['BucketName']
+        print(f"BucketConfigHandler: {event['RequestType']} on {bucket}")
+
+        if event['RequestType'] in ['Create', 'Update']:
+            # Suspend versioning
+            try:
+                s3.put_bucket_versioning(
+                    Bucket=bucket,
+                    VersioningConfiguration={'Status': 'Suspended'}
+                )
+                print(f"Versioning suspended on {bucket}")
+            except Exception as e:
+                print(f"Warning: could not suspend versioning: {e}")
+                # Non-fatal — continue to lifecycle
+
+            # Add lifecycle rule: expire noncurrent versions after 1 day,
+            # delete expired delete markers, and abort incomplete multipart after 7 days
+            try:
+                s3.put_bucket_lifecycle_configuration(
+                    Bucket=bucket,
+                    LifecycleConfiguration={
+                        'Rules': [{
+                            'ID': 'scua-cleanup-noncurrent',
+                            'Status': 'Enabled',
+                            'Filter': {'Prefix': ''},
+                            'NoncurrentVersionExpiration': {'NoncurrentDays': 1},
+                            'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 7},
+                        }]
+                    }
+                )
+                print(f"Lifecycle rule set on {bucket}")
+            except Exception as e:
+                print(f"Warning: could not set lifecycle: {e}")
+                # Non-fatal
+
+        # On Delete: leave bucket as-is (don't re-enable versioning)
+        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+    except Exception as e:
+        print(f"Error: {e}")
+        traceback.print_exc()
+        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+`),
+    });
+
+    bucketConfigHandler.addToRolePolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: [
+        's3:PutBucketVersioning',
+        's3:GetBucketVersioning',
+        's3:PutLifecycleConfiguration',
+        's3:GetLifecycleConfiguration',
+        's3:PutBucketLifecycleConfiguration',
+        's3:GetBucketLifecycleConfiguration',
+      ],
+      resources: [videoBucket.bucketArn],
+    }));
+
+    new cdk.CustomResource(this, 'BucketVersioningConfig', {
+      serviceToken: bucketConfigHandler.functionArn,
+      properties: {
+        BucketName: amplifyBucketName.valueAsString,
       },
     });
 

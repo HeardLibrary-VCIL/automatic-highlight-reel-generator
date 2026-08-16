@@ -1,4 +1,4 @@
-"""ECS entry point: download video from S3, detect dead space, segment content, write results.
+"""ECS entry point: download video from S3, detect dead space throughout, label content, write results.
 
 Integrated with SCUA-Video-Editing Amplify frontend:
   - Input  : S3_BUCKET / S3_KEY pointing at uploaded video under `video/` prefix
@@ -6,23 +6,20 @@ Integrated with SCUA-Video-Editing Amplify frontend:
              review marker → `review/{basename}.txt`    (if NEEDS_REVIEW)
 
 Pipeline stages:
-  1. Dead-space detection (analyze_deadspace): find head/tail dead regions
-  2. Audio-visual fusion segmentation:
-       A. transcribe   -- Amazon Transcribe reads the video straight from S3
-                          (already uploaded by the frontend) -> diarized turns
-       B. fuse         -- PySceneDetect shot cuts + join words/speakers onto each
-                          shot, then merge shots by speaker continuity
-       C. label        -- ONE Bedrock call discovers this video's own content-type
-                          taxonomy + topic boundaries; ONE multimodal Bedrock call
-                          labels each segment from its words AND a frame
-       D. coalesce     -- merge adjacent same-label spans (not across topics)
-  3. Write combined segment JSON to S3 for the Editor UI
+  1. Full-video dead-space detection (analyze_deadspace.analyze_full_video):
+     Finds ALL dead spans throughout the video (black, white, bars, snow, freeze+silence)
+     — not just head/tail. Returns alternating dead spans + content spans.
+  2. Transcription (AWS Transcribe):
+     Transcribes the full video with speaker diarization. Words are then sliced
+     into each content span so archivists can read/edit the transcript per segment.
+  3. Content-span labeling (Claude Sonnet via direct Anthropic API):
+     For each content span between dead gaps, samples a representative frame
+     and sends it to Claude with the segment's transcript for context.
+     Returns a short title/description for each content segment.
+  4. Write combined segment JSON to S3 for the Editor UI: alternating D and C/I
+     segments covering the full video duration, each with transcript text.
 
-All model calls go through Amazon Bedrock using the ECS task role, so no
-ANTHROPIC_API_KEY is needed anywhere in the deployed stack.
-
-The actual video trimming is triggered later by the user from the Editor UI,
-after they review and adjust the auto-detected segments.
+The actual video trimming is triggered later by the user from the Editor UI.
 """
 import json
 import os
@@ -31,12 +28,14 @@ import logging
 import tempfile
 import traceback
 import time
+import base64
+import cv2
 from pathlib import Path
 
 import boto3
 from botocore.exceptions import ClientError
 
-from analyze_deadspace import analyze, apply_trim
+from analyze_deadspace import analyze_full_video, apply_trim
 
 # --- Configuration ---
 logging.basicConfig(
@@ -49,17 +48,19 @@ log = logging.getLogger(__name__)
 # Output prefixes — match SCUA Amplify storage paths
 SEGMENT_PREFIX = os.environ.get("SEGMENT_PREFIX", "segment").strip("/")
 TRIM_MODE = os.environ.get("TRIM_MODE", "black")
-# Content-type segmentation. Credentials come from the ECS task role (Bedrock +
-# Transcribe), so "auto" simply means on; set CONTENT_SEGMENT=off to get
-# dead-space-only segments.
-CONTENT_SEGMENT = os.environ.get("CONTENT_SEGMENT", "auto")  # "auto", "on", "off"
-SEGMENT_DETECTOR = os.environ.get("SEGMENT_DETECTOR", "adaptive")  # "adaptive" or "content"
-SEGMENT_MIN_SHOT = float(os.environ.get("SEGMENT_MIN_SHOT", "1.5"))
+# Content labeling: "auto" = run if ANTHROPIC_API_KEY present; "off" = skip
+CONTENT_SEGMENT = os.environ.get("CONTENT_SEGMENT", "auto")
+# Transcription
 TRANSCRIBE_LANGUAGE = os.environ.get("TRANSCRIBE_LANGUAGE", "en-US")
 MAX_SPEAKERS = int(os.environ.get("MAX_SPEAKERS", "10"))
-# Region for boto3 service clients. The container sets AWS_REGION, but botocore
-# resolves from AWS_DEFAULT_REGION -- and Transcribe (unlike S3) has no global
-# fallback, so we pass region_name explicitly rather than rely on either var.
+# Dead-space detection tuning
+MERGE_GAP = float(os.environ.get("MERGE_GAP", "2.0"))        # bridge dead regions closer than this
+MIN_DEAD_DUR = float(os.environ.get("MIN_DEAD_DUR", "3.0"))  # min seconds for a dead span
+MIN_CONTENT_DUR = float(os.environ.get("MIN_CONTENT_DUR", "5.0"))  # content spans shorter than this get absorbed
+BLACK_PIC_TH = float(os.environ.get("BLACK_PIC_TH", "0.995"))  # black detection strictness (0.98=loose, 0.999=strict)
+# Frame sampling for Claude
+MAX_FRAME_WIDTH = int(os.environ.get("MAX_FRAME_WIDTH", "768"))
+# Region for boto3 service clients
 REGION = (os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
           or "us-east-1")
 
@@ -70,187 +71,245 @@ def segment_key(s3_key: str) -> str:
     return f"{SEGMENT_PREFIX}/{stem}.json"
 
 
-def _should_run_content_segmentation() -> bool:
-    """Whether to run the fusion segmentation. Bedrock/Transcribe auth comes from
-    the ECS task role, so there is no key to check -- only the explicit off switch."""
+def _should_run_content_labeling() -> bool:
+    """Whether to label content spans with Claude (via Bedrock, no key needed)."""
     return CONTENT_SEGMENT != "off"
 
 
-def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
-    """Stages A-D: transcribe -> shots+fuse -> discover taxonomy/topics -> label.
+# --- Transcription ---
+def turns_to_vtt(turns: list) -> str:
+    """Convert speaker turns to WebVTT format (for Aviary/captioning)."""
+    lines = ["WEBVTT", ""]
+    for i, t in enumerate(turns, 1):
+        start_h = int(t["start"] // 3600)
+        start_m = int((t["start"] % 3600) // 60)
+        start_s = t["start"] % 60
+        end_h = int(t["end"] // 3600)
+        end_m = int((t["end"] % 3600) // 60)
+        end_s = t["end"] % 60
+        lines.append(str(i))
+        lines.append(f"{start_h:02d}:{start_m:02d}:{start_s:06.3f} --> "
+                     f"{end_h:02d}:{end_m:02d}:{end_s:06.3f}")
+        speaker = t.get("speaker", "")
+        text = t.get("text", "")
+        if speaker and speaker != "spk_?":
+            lines.append(f"<v {speaker}>{text}")
+        else:
+            lines.append(text)
+        lines.append("")
+    return "\n".join(lines)
 
-    Transcribe reads the ORIGINAL S3 object (the frontend already uploaded it), so
-    nothing is re-uploaded; the local copy is only used for shot detection and for
-    sampling one frame per segment. Returns (labeled_segments, taxonomy, turns) --
-    the diarized `turns` are handed back so the segment JSON can carry each
-    segment's transcript for the reviewer.
+
+def run_transcription(s3_bucket: str, s3_key: str) -> list:
+    """Run AWS Transcribe on the video and return diarized speaker turns.
+
+    Transcribe reads the video directly from S3 (no local copy needed for audio).
+    Returns: [{"start": float, "end": float, "speaker": str, "text": str}, ...]
     """
     import boto3 as _boto3
     from transcribe import start_job, wait, fetch_result, to_speaker_turns
-    from segment_shots import detect_shots
-    from segment_fuse import attach, merge_by_speaker
-    from segment_label import (analyze_program, detect_host, segment_text,
-                               split_on_topics, label_segments, coalesce_labeled)
-    from bedrock import make_client
 
     stem = Path(s3_key).name.rsplit(".", 1)[0]
     job_name = f"scua-{stem}-{int(time.time())}"[:200]
 
-    # --- A. transcribe straight from S3 (diarized) ---
-    t0 = time.time()
     transcribe_client = _boto3.client("transcribe", region_name=REGION)
     s3_client = _boto3.client("s3", region_name=REGION)
-    log.info(f"[A] Transcribe job {job_name} on s3://{s3_bucket}/{s3_key}")
-    start_job(transcribe_client, f"s3://{s3_bucket}/{s3_key}", job_name=job_name,
+
+    media_uri = f"s3://{s3_bucket}/{s3_key}"
+    log.info(f"[Transcribe] Starting job {job_name} on {media_uri}")
+    start_job(transcribe_client, media_uri, job_name=job_name,
               language=TRANSCRIBE_LANGUAGE, max_speakers=MAX_SPEAKERS)
     job = wait(transcribe_client, job_name)
     turns = to_speaker_turns(fetch_result(job, s3_client))
     speakers = sorted({t["speaker"] for t in turns})
-    log.info(f"[A] {len(turns)} speaker turns, {len(speakers)} speakers "
-             f"in {time.time() - t0:.1f}s")
-    if not turns:
-        raise RuntimeError("Transcribe returned no speech turns")
+    log.info(f"[Transcribe] {len(turns)} speaker turns, {len(speakers)} speakers")
+    return turns
 
-    # --- B. shots + join words onto them ---
-    t0 = time.time()
-    window = (prop.content_start, prop.content_end)
-    shots = detect_shots(str(local_video_path), window, SEGMENT_DETECTOR, SEGMENT_MIN_SHOT)
-    fused = attach(shots, [(t["start"], t["end"], t["speaker"], t["text"]) for t in turns])
-    log.info(f"[B] {len(fused)} shots in window {window[0]:.1f}-{window[1]:.1f}s "
-             f"({time.time() - t0:.1f}s)")
 
-    # --- C. discover taxonomy + topic boundaries, then label multimodally ---
-    t0 = time.time()
+def transcript_for_span(turns: list, start: float, end: float) -> str:
+    """Extract transcript text for words that overlap a time span."""
+    words = []
+    for t in turns:
+        # Include turn if it overlaps with the span
+        if t["end"] > start and t["start"] < end:
+            words.append(t["text"])
+    return " ".join(words).strip()
+
+
+# --- Frame sampling ---
+def sample_frame(video_path: str, timestamp: float, max_width: int = 768) -> str:
+    """Extract a single frame at `timestamp` and return as base64 JPEG."""
+    cap = cv2.VideoCapture(video_path)
+    cap.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
+    ok, frame = cap.read()
+    cap.release()
+    if not ok:
+        return ""
+    h, w = frame.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        frame = cv2.resize(frame, (max_width, int(h * scale)))
+    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+    return base64.b64encode(buf.tobytes()).decode("ascii")
+
+
+# --- Content labeling with Claude ---
+def label_content_spans(video_path: str, content_spans, duration: float,
+                        turns: list = None) -> list:
+    """Label each content span using Claude Sonnet (1 API call per span).
+
+    For each content span, samples a frame from the midpoint and asks Claude
+    to describe what's happening — including the transcript for context if
+    available. Returns a list of dicts with title, description, and transcript.
+    """
+    from bedrock import make_client, BEDROCK_MODEL
+
     client = make_client()
-    host = detect_host(turns)
-    taxonomy, boundaries = analyze_program(turns, client)
-    log.info(f"[C] host={host} | taxonomy: " + ", ".join(t["type"] for t in taxonomy)
-             + f" | {len(boundaries)} topic boundaries")
+    model = BEDROCK_MODEL
+    labeled = []
 
-    segments = merge_by_speaker(fused, host=host)
-    segments = split_on_topics(segments, boundaries, fused)
-    for s in segments:
-        s["text"], s["speakers"] = segment_text(turns, s["start"], s["end"])
+    for i, cs in enumerate(content_spans):
+        mid = (cs.start + cs.end) / 2.0
+        span_dur = cs.end - cs.start
+        frame_b64 = sample_frame(video_path, mid, MAX_FRAME_WIDTH)
 
-    labeled = label_segments(segments, client, taxonomy, str(local_video_path), host=host)
-    labeled = coalesce_labeled(labeled)          # --- D. coalesce ---
-    log.info(f"[C/D] {len(segments)} -> {len(labeled)} labeled segments "
-             f"({time.time() - t0:.1f}s)")
-    return labeled, taxonomy, turns
+        # Get transcript for this span
+        span_transcript = ""
+        if turns:
+            span_transcript = transcript_for_span(turns, cs.start, cs.end)
+
+        # Build the prompt — include transcript snippet for context
+        transcript_context = ""
+        if span_transcript:
+            # Limit to first 500 chars to control token usage
+            snippet = span_transcript[:500]
+            if len(span_transcript) > 500:
+                snippet += "..."
+            transcript_context = f"\n\nTranscript excerpt from this segment:\n\"{snippet}\""
+
+        prompt_text = (
+            f"This frame is from an archival video at timestamp {mid:.0f}s "
+            f"(content span {cs.start:.0f}s to {cs.end:.0f}s, duration {span_dur:.0f}s, "
+            f"video total {duration:.0f}s).{transcript_context}\n\n"
+            f"Describe what is happening in this segment in 1-2 sentences. "
+            f"Then provide a short title (max 8 words) for this content segment. "
+            f"Respond in JSON: {{\"title\": \"...\", \"description\": \"...\"}}"
+        )
+
+        content_blocks = []
+        if frame_b64:
+            content_blocks.append({
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/jpeg", "data": frame_b64}
+            })
+        content_blocks.append({"type": "text", "text": prompt_text})
+
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=200,
+                messages=[{"role": "user", "content": content_blocks}],
+            )
+            text = resp.content[0].text.strip()
+            # Handle cases where Claude wraps in ```json ... ```
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+            data = json.loads(text)
+            title = data.get("title", "Content").strip()
+            description = data.get("description", "").strip()
+        except Exception as e:
+            log.warning(f"Claude labeling failed for span {i} ({cs.start:.1f}-{cs.end:.1f}s): {e}")
+            title = "Content"
+            description = ""
+
+        labeled.append({
+            "start": cs.start,
+            "end": cs.end,
+            "title": title,
+            "description": description,
+            "content_label": "content",
+            "transcript": span_transcript,
+        })
+        log.info(f"  Span {i+1}/{len(content_spans)} "
+                 f"[{cs.start:.1f}-{cs.end:.1f}s]: {title}")
+
+    return labeled
 
 
-def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
-                       turns=None) -> dict:
-    """Build a segment JSON matching SCUA Editor format.
+# --- Build output JSON ---
+def build_segment_json(s3_key: str, analysis, labeled_content=None) -> dict:
+    """Build alternating D/C/I segment JSON for the SCUA Editor.
 
-    `content_segments` are the fusion-pipeline dicts
-    {start, end, label, name, speakers}; the Editor gets the specific `name` as
-    the title (e.g. "Triangle Inn resort tour") and the content type as
-    `content_label`. Without them we fall back to simple D/I dead-space segments.
-
-    `turns` are the diarized transcript rows; when present, each content segment
-    carries a `transcript` of the words spoken over it so a reviewer can verify
-    the label and boundaries against what is actually said.
+    Interleaves dead spans (type "D") with content spans (type "C" if labeled,
+    "I" if labeling was skipped/failed) sorted by start time.
     """
     stem = Path(s3_key).name.rsplit(".", 1)[0]
     segments = []
 
-    # Recompute transcript from `turns` against each FINAL segment span rather than
-    # trusting the seg["text"] carried on the dict: that text predates coalescing
-    # and would be truncated to the first merged child.
-    if turns:
-        from segment_label import segment_text
+    # Build a unified timeline: dead + content, sorted by start
+    entries = []
+    for ds in analysis.dead_spans:
+        entries.append(("D", ds.start, ds.end, ds.kind, None))
 
-        def _transcript(start, end):
-            return segment_text(turns, start, end)[0]
+    if labeled_content:
+        for lc in labeled_content:
+            entries.append(("C", lc["start"], lc["end"], None, lc))
     else:
-        def _transcript(start, end):
-            return ""
+        # No labeling — mark all content spans as generic "I"
+        for cs in analysis.content_spans:
+            entries.append(("I", cs.start, cs.end, None, None))
 
-    if content_segments:
-        # Use the fusion segmentation results, keeping head/tail dead-space markers
-        if prop.content_start > 1.0:
-            segments.append({
-                "segment_start": 0,
-                "segment_end": round(prop.content_start, 2),
-                "segment_type": "D",
-                "title": "Head dead space (auto-detected)",
-            })
+    entries.sort(key=lambda x: x[1])
 
-        for seg in content_segments:
-            label = seg.get("label", "other")
-            name = (seg.get("name") or "").strip()
-            # Editor segment_type codes: "C" = a recognized content type,
-            # "I" = generic/unclassified content.
-            seg_type = "I" if label == "other" else "C"
-            segments.append({
-                "segment_start": round(seg["start"], 2),
-                "segment_end": round(seg["end"], 2),
-                "segment_type": seg_type,
-                "title": name or label.title(),
-                "content_label": label,
-                "speakers": seg.get("speakers", []),
-                "transcript": _transcript(seg["start"], seg["end"]),
-            })
+    for seg_type, start, end, dead_kind, label_data in entries:
+        seg = {
+            "segment_start": round(start, 2),
+            "segment_end": round(end, 2),
+            "segment_type": seg_type,
+        }
+        if seg_type == "D":
+            seg["title"] = f"Dead space ({dead_kind})" if dead_kind else "Dead space"
+        elif seg_type == "C" and label_data:
+            seg["title"] = label_data.get("title", "Content")
+            seg["content_label"] = label_data.get("content_label", "content")
+            if label_data.get("description"):
+                seg["description"] = label_data["description"]
+            if label_data.get("transcript"):
+                seg["transcript"] = label_data["transcript"]
+        else:
+            seg["title"] = "Content"
 
-        if prop.duration - prop.content_end > 1.0:
-            segments.append({
-                "segment_start": round(prop.content_end, 2),
-                "segment_end": round(prop.duration, 2),
-                "segment_type": "D",
-                "title": "Tail dead space (auto-detected)",
-            })
-    else:
-        # Fallback: simple dead-space-only segments
-        if prop.content_start > 1.0:
-            segments.append({
-                "segment_start": 0,
-                "segment_end": round(prop.content_start, 2),
-                "segment_type": "D",
-                "title": "Head dead space (auto-detected)",
-            })
+        segments.append(seg)
 
-        segments.append({
-            "segment_start": round(prop.content_start, 2),
-            "segment_end": round(prop.content_end, 2),
-            "segment_type": "I",
-            "title": "Content",
-        })
+    total_content = sum(cs.end - cs.start for cs in analysis.content_spans)
+    kept_pct = (100 * total_content / analysis.duration) if analysis.duration else 0
 
-        if prop.duration - prop.content_end > 1.0:
-            segments.append({
-                "segment_start": round(prop.content_end, 2),
-                "segment_end": round(prop.duration, 2),
-                "segment_type": "D",
-                "title": "Tail dead space (auto-detected)",
-            })
-
-    out = {
+    return {
         "video": stem,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "auto_detected": True,
-        "content_segmented": content_segments is not None,
-        "trim_status": prop.status,
-        "duration": round(prop.duration, 2),
-        "kept_pct": round(prop.kept_pct, 1),
+        "content_segmented": labeled_content is not None,
+        "status": analysis.status,
+        "duration": round(analysis.duration, 2),
+        "kept_pct": round(kept_pct, 1),
+        "dead_span_count": len(analysis.dead_spans),
+        "content_span_count": len(analysis.content_spans),
         "segments": segments,
     }
-    if taxonomy:
-        # The per-video content types the model discovered, so the Editor can show
-        # (and let a human correct) the vocabulary the labels came from.
-        out["taxonomy"] = taxonomy
-    return out
 
 
-def write_review_marker(s3_client, bucket: str, s3_key: str, prop) -> None:
+def write_review_marker(s3_client, bucket: str, s3_key: str, analysis) -> None:
     """Drop a review marker so a human can find flagged files."""
     stem = Path(s3_key).name.rsplit(".", 1)[0]
+    total_dead = sum(ds.end - ds.start for ds in analysis.dead_spans)
+    total_content = sum(cs.end - cs.start for cs in analysis.content_spans)
     body = (
         f"source: s3://{bucket}/{s3_key}\n"
-        f"status: {prop.status}\n"
-        f"proposed content: {prop.content_start:.2f}s -> {prop.content_end:.2f}s\n"
-        f"kept: {prop.kept_pct:.0f}%\n"
-        + "".join(f"note: {n}\n" for n in prop.notes)
+        f"status: {analysis.status}\n"
+        f"duration: {analysis.duration:.1f}s\n"
+        f"dead spans: {len(analysis.dead_spans)} ({total_dead:.1f}s)\n"
+        f"content spans: {len(analysis.content_spans)} ({total_content:.1f}s)\n"
+        + "".join(f"note: {n}\n" for n in analysis.notes)
     )
     try:
         s3_client.put_object(Bucket=bucket, Key=f"review/{stem}.txt",
@@ -307,12 +366,10 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
             trimmed_path = temp_dir / f"{video_name}_trimmed.mp4"
 
             if len(keep_segments) == 1:
-                # Single segment — simple cut
                 seg = keep_segments[0]
                 log.info(f"Trimming single segment: {seg['start']:.2f}s -> {seg['end']:.2f}s")
                 apply_trim(str(local_video_path), str(trimmed_path), seg["start"], seg["end"])
             else:
-                # Multiple segments — cut each then concatenate
                 import subprocess
                 clip_paths = []
                 for i, seg in enumerate(keep_segments):
@@ -321,13 +378,11 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
                     apply_trim(str(local_video_path), str(clip_path), seg["start"], seg["end"])
                     clip_paths.append(clip_path)
 
-                # Write concat list
                 concat_file = temp_dir / "concat.txt"
                 with open(concat_file, "w") as f:
                     for cp in clip_paths:
                         f.write(f"file '{cp}'\n")
 
-                # Concatenate
                 log.info(f"Concatenating {len(clip_paths)} clips...")
                 subprocess.run(
                     ["ffmpeg", "-nostdin", "-y", "-f", "concat", "-safe", "0",
@@ -336,12 +391,11 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
                     stderr=subprocess.DEVNULL, check=True,
                 )
 
-            # Upload trimmed video
             output_key = f"edit/{video_name}_trimmed.mp4"
             log.info(f"Uploading trimmed video to s3://{s3_bucket}/{output_key}")
             s3_client.upload_file(str(trimmed_path), s3_bucket, output_key)
 
-            log.info(f"=== SCUA Video Trimmer Finished Successfully in "
+            log.info(f"=== SCUA Video Trimmer Finished in "
                      f"{time.time() - pipeline_start_time:.2f}s ===")
 
         except ClientError as e:
@@ -355,8 +409,8 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
 
 
 def run_detect(s3_bucket, s3_key, pipeline_start_time):
-    """Detect dead space and write segment JSON."""
-    log.info("=== SCUA Segment Detector Starting ===")
+    """Full-video dead-space detection + content labeling."""
+    log.info("=== SCUA Full-Video Segment Detector Starting ===")
     log.info(f"Processing s3://{s3_bucket}/{s3_key}  (mode={TRIM_MODE})")
     s3_client = boto3.client("s3")
 
@@ -365,59 +419,141 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
 
         try:
             filename = Path(s3_key).name
-            stem = filename.rsplit(".", 1)[0]
             local_video_path = temp_dir / filename
             log.info(f"Downloading video to {local_video_path}...")
             s3_client.download_file(s3_bucket, s3_key, str(local_video_path))
 
-            # --- STAGE 1: PROBE ---
+            # --- STAGE 1: FULL-VIDEO DEAD-SPACE DETECTION ---
             stage1_start = time.time()
-            prop = analyze(str(local_video_path), mode=TRIM_MODE)
-            log.info(
-                f"--- Stage 1 (Probe) completed in {time.time() - stage1_start:.2f}s --- "
-                f"content {prop.content_start:.2f}s -> {prop.content_end:.2f}s | "
-                f"head {prop.head_trim:.2f}s, tail {prop.tail_trim:.2f}s | "
-                f"kept {prop.kept_pct:.0f}% | status={prop.status}"
+            analysis = analyze_full_video(
+                str(local_video_path),
+                mode=TRIM_MODE,
+                merge_gap=MERGE_GAP,
+                min_dead_dur=MIN_DEAD_DUR,
+                min_content_dur=MIN_CONTENT_DUR,
+                black_pic_th=BLACK_PIC_TH,
             )
-            for n in prop.notes:
+            total_dead = sum(ds.end - ds.start for ds in analysis.dead_spans)
+            total_content = sum(cs.end - cs.start for cs in analysis.content_spans)
+            log.info(
+                f"--- Stage 1 (Full-video probe) completed in "
+                f"{time.time() - stage1_start:.2f}s ---\n"
+                f"  Duration: {analysis.duration:.1f}s | "
+                f"Dead spans: {len(analysis.dead_spans)} ({total_dead:.1f}s) | "
+                f"Content spans: {len(analysis.content_spans)} ({total_content:.1f}s) | "
+                f"Status: {analysis.status}"
+            )
+            for ds in analysis.dead_spans:
+                log.info(f"  DEAD [{ds.start:.1f}s -> {ds.end:.1f}s] "
+                         f"{ds.kind} ({ds.end - ds.start:.1f}s)")
+            for cs in analysis.content_spans:
+                log.info(f"  CONTENT [{cs.start:.1f}s -> {cs.end:.1f}s] "
+                         f"({cs.end - cs.start:.1f}s)")
+            for n in analysis.notes:
                 log.info(f"  note: {n}")
 
-            # --- STAGE 2: AUDIO-VISUAL FUSION SEGMENTATION ---
+            # --- STAGE 2: TRANSCRIPTION (cached — reuses existing transcript on re-runs) ---
             stage2_start = time.time()
-            content_segments, taxonomy, transcript_turns = None, None, None
+            turns = None
+            transcript_s3_key = f"transcript/{Path(s3_key).name.rsplit('.', 1)[0]}.json"
 
-            if _should_run_content_segmentation() and prop.status == "OK" and prop.kept > 0:
-                log.info("Running audio-visual fusion segmentation...")
+            if analysis.content_spans:
+                # Try to load cached transcript from S3 (from a previous run)
                 try:
-                    content_segments, taxonomy, transcript_turns = run_fusion_segmentation(
-                        local_video_path, s3_bucket, s3_key, prop)
-                    log.info(f"Fusion segmentation complete: {len(content_segments)} segments "
-                             f"in {time.time() - stage2_start:.2f}s")
-                    for s in content_segments:
-                        log.info(f"  [{s['start']:.2f}s -> {s['end']:.2f}s] "
-                                 f"{s['label']} ({s.get('name', '')})")
-                except Exception as e:
-                    # Never fail the whole run: the Editor still gets the
-                    # dead-space timeline if the fusion stage breaks.
-                    log.warning(f"Fusion segmentation failed (falling back to dead-space only): {e}")
-                    log.warning(traceback.format_exc())
-                    content_segments, taxonomy, transcript_turns = None, None, None
-            elif not _should_run_content_segmentation():
-                log.info("Content segmentation disabled (CONTENT_SEGMENT=off)")
-            else:
-                log.info("Skipping content segmentation (trim status not OK or no content)")
+                    resp = s3_client.get_object(Bucket=s3_bucket, Key=transcript_s3_key)
+                    turns = json.loads(resp["Body"].read().decode("utf-8"))
+                    log.info(f"[Transcribe] Loaded cached transcript from "
+                             f"s3://{s3_bucket}/{transcript_s3_key} "
+                             f"({len(turns)} turns)")
+                except (ClientError, Exception):
+                    turns = None
 
-            # --- STAGE 3: WRITE SEGMENTS ---
+                # Only run Transcribe if no cached transcript exists
+                if turns is None:
+                    log.info("No cached transcript — running AWS Transcribe...")
+                    try:
+                        turns = run_transcription(s3_bucket, s3_key)
+                        total_speech = sum(t["end"] - t["start"] for t in turns)
+                        log.info(f"--- Stage 2 (Transcribe) completed in "
+                                 f"{time.time() - stage2_start:.2f}s --- "
+                                 f"{len(turns)} turns, {total_speech:.0f}s of speech")
+                        # Cache the transcript to S3 for future re-runs
+                        s3_client.put_object(
+                            Bucket=s3_bucket,
+                            Key=transcript_s3_key,
+                            Body=json.dumps(turns, indent=2).encode("utf-8"),
+                            ContentType="application/json",
+                        )
+                        # Also write VTT for Aviary / captioning
+                        vtt_key = transcript_s3_key.replace(".json", ".vtt")
+                        s3_client.put_object(
+                            Bucket=s3_bucket,
+                            Key=vtt_key,
+                            Body=turns_to_vtt(turns).encode("utf-8"),
+                            ContentType="text/vtt",
+                        )
+                        log.info(f"  Cached transcript to s3://{s3_bucket}/{transcript_s3_key}")
+                        log.info(f"  Wrote VTT to s3://{s3_bucket}/{vtt_key}")
+                    except Exception as e:
+                        log.warning(f"Transcription failed (continuing without transcript): {e}")
+                        log.warning(traceback.format_exc())
+                        turns = None
+                else:
+                    log.info(f"--- Stage 2 (Transcribe) skipped — using cached transcript "
+                             f"({time.time() - stage2_start:.2f}s) ---")
+            else:
+                log.info("No content spans — skipping transcription")
+
+            # --- STAGE 3: CONTENT LABELING (Claude Sonnet) ---
             stage3_start = time.time()
+            labeled_content = None
+
+            if (_should_run_content_labeling()
+                    and analysis.status == "OK"
+                    and analysis.content_spans):
+                log.info(f"Labeling {len(analysis.content_spans)} content spans "
+                         f"with Claude Sonnet...")
+                try:
+                    labeled_content = label_content_spans(
+                        str(local_video_path),
+                        analysis.content_spans,
+                        analysis.duration,
+                        turns=turns,
+                    )
+                    log.info(f"Content labeling complete in "
+                             f"{time.time() - stage3_start:.2f}s")
+                except Exception as e:
+                    log.warning(f"Content labeling failed (falling back to unlabeled): {e}")
+                    log.warning(traceback.format_exc())
+                    labeled_content = None
+            elif not _should_run_content_labeling():
+                log.info("Content labeling disabled (no ANTHROPIC_API_KEY or CONTENT_SEGMENT=off)")
+            else:
+                log.info("Skipping content labeling (status not OK or no content spans)")
+
+            # If labeling was skipped but we have transcripts, still attach them
+            if labeled_content is None and turns and analysis.content_spans:
+                labeled_content = []
+                for cs in analysis.content_spans:
+                    labeled_content.append({
+                        "start": cs.start,
+                        "end": cs.end,
+                        "title": "Content",
+                        "description": "",
+                        "content_label": "content",
+                        "transcript": transcript_for_span(turns, cs.start, cs.end),
+                    })
+
+            # --- STAGE 4: WRITE SEGMENTS ---
+            stage4_start = time.time()
             seg_s3_key = segment_key(s3_key)
 
-            if prop.status == "NEEDS_REVIEW":
-                write_review_marker(s3_client, s3_bucket, s3_key, prop)
+            if analysis.status == "NEEDS_REVIEW":
+                write_review_marker(s3_client, s3_bucket, s3_key, analysis)
 
-            # Always write segment JSON so the Editor can display it
-            seg_json = build_segment_json(s3_key, prop, content_segments, taxonomy,
-                                          transcript_turns)
-            log.info(f"Uploading segment JSON to s3://{s3_bucket}/{seg_s3_key}")
+            seg_json = build_segment_json(s3_key, analysis, labeled_content)
+            log.info(f"Uploading segment JSON to s3://{s3_bucket}/{seg_s3_key} "
+                     f"({len(seg_json['segments'])} segments)")
             s3_client.put_object(
                 Bucket=s3_bucket,
                 Key=seg_s3_key,
@@ -425,8 +561,8 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 ContentType="application/json",
             )
 
-            log.info(f"--- Stage 3 (Write Segments) completed in "
-                     f"{time.time() - stage3_start:.2f}s ---")
+            log.info(f"--- Stage 4 (Write) completed in "
+                     f"{time.time() - stage4_start:.2f}s ---")
 
         except ClientError as e:
             log.error(f"S3 error: {e.response['Error']['Message']}")
@@ -437,7 +573,7 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             log.error(traceback.format_exc())
             sys.exit(1)
 
-    log.info(f"=== SCUA Segment Detector Finished Successfully in "
+    log.info(f"=== SCUA Segment Detector Finished in "
              f"{time.time() - pipeline_start_time:.2f}s ===")
 
 
