@@ -1,5 +1,4 @@
 import os
-import io
 import time
 import tempfile
 import traceback
@@ -16,21 +15,25 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import streamlit as st
-from botocore.exceptions import ClientError
 
 from ui.config import (
-    INPUT_PREFIX,
-    RESULT_PREFIX,
     DEFAULT_PROMPT,
     PROMPT_MAX_CHARS,
     TARGET_MAX_SIZE_GB,
-    UPLOAD_LIMIT_MB,
+    POLL_SECONDS,
+    MAX_WAIT_MIN,
 )
-from ui.config import get_initial_settings, persist_settings, limits_bytes
+from ui.config import get_initial_settings, persist_settings
 from ui.aws_client import get_s3_client, discover_bucket_from_stack, object_exists
-from ui.upload import save_uploaded_to_disk, check_free_space, multipart_upload, copy_s3_object_to_input
-from ui.polling import poll_for_result, result_key_for_input
-from ui.logs import latest_log_line, get_pipeline_status, PipelineStatus
+from ui.upload import (
+    save_uploaded_to_disk,
+    check_free_space,
+    multipart_upload,
+    copy_s3_object_to_input,
+    s3_key_for_upload,
+)
+from ui.polling import result_key_for_input
+from ui.logs import latest_log_line
 
 
 st.set_page_config(page_title="Highlight Uploader", layout="centered")
@@ -44,6 +47,86 @@ def _human_size(n: int) -> str:
     return f"{n} B"
 
 
+def _parse_s3_uri(uri: str):
+    """Parse s3://bucket/key into (bucket, key). Raises ValueError on bad input."""
+    if not uri.startswith("s3://"):
+        raise ValueError("Must start with s3://")
+    bucket, _, key = uri[5:].partition("/")
+    if not bucket or not key:
+        raise ValueError("Provide a full s3://bucket/key")
+    return bucket, key
+
+
+_STATUS_ICON = {
+    "queued": "⏳",
+    "uploading": "⬆️",
+    "processing": "⚙️",
+    "done": "✅",
+    "failed": "❌",
+    "timeout": "⌛",
+}
+
+
+def _stage_to_disk(job: dict, tmpdir: str) -> str:
+    """Stage a browser upload or a local-path job onto local disk for multipart upload.
+    Returns the temp path. S3-URI jobs never reach here (they are copied server-side).
+    """
+    temp_path = os.path.join(tmpdir, os.path.basename(job["name"]))
+    if job["kind"] == "local":
+        lp = Path(job["src"])
+        # Hardlink when possible to avoid copying multi-GB files; fall back to copy.
+        try:
+            os.link(str(lp), temp_path)
+        except Exception:
+            shutil.copy2(str(lp), temp_path)
+    else:  # browser upload
+        uf = job["src"]
+        uf.seek(0)
+        save_uploaded_to_disk(uf, temp_path)
+    return temp_path
+
+
+def _upload_with_progress(s3, bucket, temp_path, prompt, prog, label, dry_run):
+    """Run a single multipart upload in a worker thread while updating a Streamlit
+    progress bar from the main thread. Returns (key, error_text)."""
+    q: Queue = Queue()
+    result = {"key": None, "error": None}
+
+    def on_progress(ps):
+        # Called from s3transfer threads; never touch Streamlit here. Queue instead.
+        try:
+            q.put(ps, block=False)
+        except Exception:
+            pass
+
+    def worker():
+        try:
+            result["key"] = multipart_upload(
+                s3,
+                bucket=bucket,
+                src_path=temp_path,
+                prompt=prompt,
+                on_progress=on_progress,
+                dry_run=dry_run,
+            )
+        except Exception:
+            result["error"] = traceback.format_exc()
+
+    t = Thread(target=worker, daemon=True)
+    t.start()
+    while t.is_alive():
+        try:
+            ps = q.get(timeout=0.2)
+            eta = f"ETA {timedelta(seconds=int(ps.eta))}" if ps.eta else "Estimating…"
+            prog.progress(min(ps.pct / 100.0, 1.0), text=f"{label} • {ps.pct:.1f}% • {eta}")
+        except Empty:
+            pass
+        time.sleep(0.05)
+    t.join(timeout=1)
+    return result["key"], result["error"]
+
+
+# -------- Sidebar settings --------
 with st.sidebar:
     st.header("Settings")
     s = get_initial_settings()
@@ -60,83 +143,106 @@ with st.sidebar:
             bucket = discovered
     bucket = st.text_input("S3 Bucket", value=bucket or "")
     region = st.text_input("AWS Region", value=region or "")
-    stack_name = st.text_input("Stack name (for CloudWatch log groups)", value=stack_name or "HighlightProcessorStack")
+    stack_name = st.text_input(
+        "Stack name (for CloudWatch log groups)", value=stack_name or "HighlightProcessorStack"
+    )
     if st.button("Save settings"):
         persist_settings(bucket.strip() or None, region.strip() or None, stack_name.strip() or None)
         st.success("Saved. Restart not required.")
 
 st.title("Automatic Highlight Reel – Local UI")
 
-max_size_bytes, _ = limits_bytes()
-
 # -------- Upload Section --------
-st.header("Upload Video")
+st.header("Upload Videos")
+st.caption("Upload one or more videos at once. Every selected video is processed with the same prompt below.")
 
-# Initialize variables used later
-use_s3_uri = False
-s3_uri_input = ""
-use_local = False
-local_path = ""
+# Each source below contributes to a single flat list of jobs.
+# job = {"kind": "upload"|"local"|"s3uri", "name": str, "src": <obj>, "size": Optional[int]}
+jobs: list[dict] = []
 
 col_quick, col_large = st.columns(2)
 
 with col_quick:
     st.subheader("Quick upload")
-    st.caption(
-        "Best for smaller videos. Drag and drop to upload via your browser. For multi‑GB files, use 'Large upload'."
-    )
-    uploaded = st.file_uploader(
-        "Drag and drop or browse a video",
+    st.caption("Best for smaller videos. Drag and drop several at once. For multi‑GB files, use 'Large upload'.")
+    uploaded_files = st.file_uploader(
+        "Drag and drop or browse videos",
         type=["mp4", "mov", "mkv", "avi"],
-        accept_multiple_files=False,
+        accept_multiple_files=True,
     )
+    for uf in uploaded_files or []:
+        jobs.append({"kind": "upload", "name": uf.name, "src": uf, "size": uf.size})
 
 with col_large:
     st.subheader("Large upload (recommended for big files)")
-    st.caption("Avoid browser bottlenecks by using a local path or an existing S3 object.")
+    st.caption("Avoid browser bottlenecks by using local paths or existing S3 objects — one per line.")
     large_method = st.selectbox(
         "Choose a large upload method",
-        ["Local file path on this machine", "Existing S3 object (s3://bucket/key)"],
+        ["Local file paths on this machine", "Existing S3 objects (s3://bucket/key)"],
         index=0,
     )
 
-    if large_method == "Local file path on this machine":
-        local_path = st.text_input("Local video path (absolute path preferred)", value="")
-        use_local = st.checkbox("Use this local path", value=False)
-        if use_local and local_path:
-            try:
-                lp = Path(local_path).expanduser().resolve()
-                if lp.exists() and lp.is_file():
-                    # Mimic the uploaded object minimally
-                    class _Local:
-                        name = lp.name
-                        size = lp.stat().st_size
-                        def seek(self, *_):
-                            return None
-                    uploaded = _Local()  # type: ignore
-                    st.info(f"Selected local file: {lp} ({_human_size(lp.stat().st_size)})")
-                else:
-                    st.warning("Path does not exist or is not a file.")
-            except Exception as e:
-                st.warning(f"Invalid path: {e}")
+    if large_method == "Local file paths on this machine":
+        local_paths = st.text_area(
+            "Local video paths (one absolute path per line)", value="", height=100
+        )
+        use_local = st.checkbox("Use these local paths", value=False)
+        if use_local:
+            for line in local_paths.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    lp = Path(line).expanduser().resolve()
+                    if lp.exists() and lp.is_file():
+                        jobs.append(
+                            {"kind": "local", "name": lp.name, "src": str(lp), "size": lp.stat().st_size}
+                        )
+                    else:
+                        st.warning(f"Skipping (not a file): {line}")
+                except Exception as e:
+                    st.warning(f"Skipping invalid path '{line}': {e}")
     else:
-        s3_uri_input = st.text_input("S3 URI (s3://bucket/path/file.mp4)", value="")
-        use_s3_uri = st.checkbox("Use this S3 object", value=False)
+        s3_uris = st.text_area(
+            "S3 URIs (one s3://bucket/path/file.mp4 per line)", value="", height=100
+        )
+        use_s3_uri = st.checkbox("Use these S3 objects", value=False)
+        if use_s3_uri:
+            for line in s3_uris.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    src_bucket, src_key = _parse_s3_uri(line)
+                    jobs.append(
+                        {"kind": "s3uri", "name": os.path.basename(src_key), "src": (src_bucket, src_key), "size": None}
+                    )
+                except Exception as e:
+                    st.warning(f"Skipping invalid S3 URI '{line}': {e}")
+
+# Summary of everything selected across sources.
+if jobs:
+    total_known = sum(j["size"] for j in jobs if j["size"])
+    st.info(f"Selected {len(jobs)} video(s) — total {_human_size(total_known)} (known sizes)")
+    with st.expander("Selected videos", expanded=len(jobs) <= 10):
+        for j in jobs:
+            size = _human_size(j["size"]) if j["size"] else "size unknown"
+            st.write(f"• {j['name']} — {size}  ·  _{j['kind']}_")
 
 st.divider()
 
 # -------- Process Section --------
-st.header("Process Video")
+st.header("Process Videos")
 
 prompt = st.text_area(
-    "Custom prompt (optional)", value=DEFAULT_PROMPT, max_chars=PROMPT_MAX_CHARS, height=80
+    "Custom prompt (applies to all videos, optional)",
+    value=DEFAULT_PROMPT,
+    max_chars=PROMPT_MAX_CHARS,
+    height=80,
 )
 
-if uploaded is not None:
-    st.info(f"Selected: {uploaded.name} ({_human_size(uploaded.size)})")
-
 col1, col2 = st.columns(2)
-start = col1.button("Start upload & process", type="primary", disabled=uploaded is None)
+start = col1.button("Start upload & process", type="primary", disabled=not jobs)
 reset = col2.button("Reset")
 
 if reset:
@@ -144,364 +250,155 @@ if reset:
     st.rerun()
 
 status = st.empty()
-progress = st.progress(0.0, text="Idle")
-debug_box = st.empty()
+overall = st.progress(0.0, text="Idle")
+list_box = st.empty()
+log_box = st.empty()
 
-# Stacked checklist placeholders for stages
-stages_container = st.container()
-with stages_container:
-    stage_lambda_ph = st.empty()
-    stage_ecs_ph = st.empty()
-    stage1_ph = st.empty()
-    stage2_ph = st.empty()
-    stage3_ph = st.empty()
-    stage_done_ph = st.empty()
 
-def _render_stages(st_status: PipelineStatus) -> None:
-    def render(ph, ok: bool, label: str) -> None:
-        icon = "✅" if ok else "⏳"
-        ph.markdown(f"{icon} {label}")
+def _render_status_list(records: list[dict]) -> None:
+    lines = []
+    for r in records:
+        icon = _STATUS_ICON.get(r["status"], "⏳")
+        note = f" — {r['note']}" if r.get("note") else ""
+        lines.append(f"{icon} **{r['label']}** — {r['status']}{note}")
+    list_box.markdown("\n\n".join(lines))
 
-    render(stage_lambda_ph, st_status.lambda_triggered, "Lambda trigger received")
-    render(stage_ecs_ph, st_status.ecs_task_started, "ECS task started (spin-up)")
-    render(stage1_ph, st_status.stage1_done, "Stage 1: Downsampling")
-    infix = f" — {st_status.stage2_inference_pct:.0f}%" if st_status.stage2_inference_pct is not None else ""
-    render(stage2_ph, st_status.stage2_done or (st_status.stage2_inference_pct is not None), f"Stage 2: Inference{infix}")
-    render(stage3_ph, st_status.stage3_done or st_status.stage3_started, "Stage 3: Clipping & Merging")
-    render(stage_done_ph, st_status.finished_success, "Finished successfully")
 
-def _normalize_status(st_status: PipelineStatus) -> PipelineStatus:
-    """Ensure stage monotonicity: if a later stage is reached, mark prior ones as done.
-    This prevents UI inconsistencies like Stage 2 done while Stage 1 appears pending.
-    """
-    # Finished implies all done
-    if st_status.finished_success:
-        st_status.stage3_done = True
-        st_status.stage3_started = True
-        st_status.stage2_done = True
-        st_status.stage2_inference_pct = 100.0
-        st_status.stage1_done = True
-        st_status.ecs_task_started = True
-        st_status.lambda_triggered = True
-        return st_status
-
-    # If Stage 3 started/done, imply Stage 2 and Stage 1
-    if st_status.stage3_done or st_status.stage3_started:
-        st_status.stage2_done = True
-        st_status.stage2_inference_pct = 100.0
-        st_status.stage1_done = True
-        st_status.ecs_task_started = True
-        st_status.lambda_triggered = True
-
-    # If Stage 2 has progressed/done, imply Stage 1 and earlier
-    if st_status.stage2_done or (st_status.stage2_inference_pct is not None):
-        st_status.stage1_done = True
-        st_status.ecs_task_started = True
-        st_status.lambda_triggered = True
-
-    # If Stage 1 done, imply ECS started and Lambda triggered
-    if st_status.stage1_done:
-        st_status.ecs_task_started = True
-        st_status.lambda_triggered = True
-
-    # If ECS started, imply Lambda triggered
-    if st_status.ecs_task_started:
-        st_status.lambda_triggered = True
-
-    return st_status
-
-if start and ((uploaded is not None) or (use_s3_uri and s3_uri_input)):
-    # Validate settings
+if start and jobs:
     if not bucket:
         st.error("Bucket is required. Set it in Settings.")
         st.stop()
-    # If using S3 URI mode, skip local staging/upload and do server-side copy
-    if use_s3_uri and s3_uri_input:
-        s3 = get_s3_client(region or None)
-        # parse s3://bucket/key
-        try:
-            if not s3_uri_input.startswith("s3://"):
-                raise ValueError("Must start with s3://")
-            bucket_src_key = s3_uri_input[5:]
-            src_bucket, _, src_key = bucket_src_key.partition("/")
-            if not src_bucket or not src_key:
-                raise ValueError("Provide full s3://bucket/key")
-        except Exception as e:
-            st.error(f"Invalid S3 URI: {e}")
-            st.stop()
 
-        status.info("Copying object in S3 and attaching prompt metadata…")
-        try:
-            dest_key = copy_s3_object_to_input(
-                s3,
-                dest_bucket=bucket,
-                source_bucket=src_bucket,
-                source_key=src_key,
-                prompt=prompt.strip() or None,
-            )
-        except Exception as e:
-            status.error("S3 copy failed.")
-            with st.expander("Show error details"):
-                st.code(str(e), language="text")
-            st.stop()
+    # Two videos with the same basename would collide on the same S3 input key and
+    # overwrite each other. Stop early with a clear message rather than lose one.
+    target_keys = [s3_key_for_upload(j["name"]) for j in jobs]
+    dupes = {k for k in target_keys if target_keys.count(k) > 1}
+    if dupes:
+        st.error(
+            "Some videos share the same filename and would overwrite each other in S3:\n"
+            + "\n".join(f"• {os.path.basename(k)}" for k in sorted(dupes))
+            + "\nRename them so each has a unique filename."
+        )
+        st.stop()
 
-        progress.progress(1.0, text="S3 copy complete. Starting processing…")
-        # Polling phase with pipeline progress
-        status.info("Processing in backend… This can take several minutes.")
-        log_box = st.empty()
+    s3 = get_s3_client(region or None)
+    tmpdir = tempfile.mkdtemp(prefix="hl_upload_")
+
+    # ---- Upload phase: process each job sequentially, one progress bar each. ----
+    records: list[dict] = []
+    max_bytes = TARGET_MAX_SIZE_GB * 1024 * 1024 * 1024
+    status.info("Uploading videos to S3…")
+
+    for i, job in enumerate(jobs):
+        label = job["name"]
+        prog = st.progress(0.0, text=f"Queued: {label}")
+        rec = {"label": label, "input_key": None, "result_key": None, "status": "uploading", "note": None}
+        records.append(rec)
+        try:
+            if job["size"] and job["size"] > max_bytes:
+                raise ValueError(f"File exceeds {TARGET_MAX_SIZE_GB} GB limit.")
+
+            if job["kind"] == "s3uri":
+                src_bucket, src_key = job["src"]
+                prog.progress(0.5, text=f"Copying in S3: {label}")
+                input_key = copy_s3_object_to_input(
+                    s3,
+                    dest_bucket=bucket,
+                    source_bucket=src_bucket,
+                    source_key=src_key,
+                    prompt=prompt.strip() or None,
+                )
+            else:
+                temp_path = _stage_to_disk(job, tmpdir)
+                if not check_free_space(temp_path, os.path.getsize(temp_path) * 2):
+                    raise RuntimeError("Insufficient disk space for staging upload.")
+                input_key, err = _upload_with_progress(
+                    s3, bucket, temp_path, prompt.strip() or None, prog, f"Uploading {label}", dry_run
+                )
+                if err:
+                    raise RuntimeError(err)
+
+            prog.progress(1.0, text=f"Uploaded: {label}")
+            rec["input_key"] = input_key
+            rec["result_key"] = result_key_for_input(input_key)
+            rec["status"] = "processing"
+        except Exception as e:
+            prog.progress(1.0, text=f"Failed: {label}")
+            rec["status"] = "failed"
+            rec["note"] = str(e).strip().splitlines()[-1] if str(e).strip() else "upload failed"
+
+        overall.progress((i + 1) / len(jobs), text=f"Uploaded {i + 1}/{len(jobs)}")
+
+    _render_status_list(records)
+
+    # ---- Processing phase: poll each result object until done or timeout. ----
+    pending = [r for r in records if r["status"] == "processing"]
+    if pending:
+        status.info(f"Processing {len(pending)} video(s) in backend… This can take several minutes each.")
         stack = stack_name or os.getenv("STACK_NAME", "HighlightProcessorStack")
-        processing_start_time = time.time()
+        log_groups = [
+            f"/aws/lambda/{stack}-VideoTriggerLambda",
+            f"/ecs/video-processor-{stack}",
+        ]
+        deadline = time.time() + MAX_WAIT_MIN * 60
 
-        # Interleave S3 existence checks with CloudWatch status peeks (non-blocking)
-        result_key = result_key_for_input(dest_key)
-        found = False
-        start_wait = time.time()
-        while True:
-            st_status: PipelineStatus = get_pipeline_status(
-                region or None, stack, dest_key, start_time=processing_start_time
-            )
-            st_status = _normalize_status(st_status)
-            pct = st_status.overall_pct() / 100.0
-            _render_stages(st_status)
-            progress.progress(pct, text=f"Processing… {int(pct*100)}%")
-
-            # Show last log line for context
-            log_line = latest_log_line(
-                region or None,
-                [
-                    f"/aws/lambda/{stack}-VideoTriggerLambda",
-                    f"/ecs/video-processor-{stack}",
-                ],
-            )
-            if log_line:
-                log_box.caption(f"Last log: {log_line.strip()}")
-
-            # Non-blocking check if output appeared in S3
-            try:
-                found = object_exists(s3, bucket, result_key)
-            except Exception:
-                found = False
-
-            if found or st_status.finished_success:
-                break
-            # Gentle wait before the next peek
-            time.sleep(5)
-
-        # If finished_success but S3 object not yet visible, wait briefly (grace period)
-        if (not found) and st_status.finished_success:
-            t0 = time.time()
-            while time.time() - t0 < 60:
+        while any(r["status"] == "processing" for r in records):
+            for r in records:
+                if r["status"] != "processing":
+                    continue
                 try:
-                    if object_exists(s3, bucket, result_key):
-                        found = True
-                        break
+                    if object_exists(s3, bucket, r["result_key"]):
+                        r["status"] = "done"
                 except Exception:
                     pass
-                time.sleep(2)
 
-        if found:
-            # Force-finish UI since the result object exists even if logs didn't include the final message
-            try:
-                st_status.finished_success = True  # type: ignore[name-defined]
-                st_status = _normalize_status(st_status)  # type: ignore[name-defined]
-                _render_stages(st_status)  # type: ignore[name-defined]
-            except Exception:
-                pass
-            progress.progress(1.0, text="Processing… 100%")
-            status.success("Highlights ready!")
-            s3_path = f"s3://{bucket}/{result_key}"
-            st.write(s3_path)
-            try:
-                obj = s3.get_object(Bucket=bucket, Key=result_key)
-                data = obj["Body"].read()
-                st.video(data)
-                st.download_button(
-                    "Download highlights",
-                    data=data,
-                    file_name=os.path.basename(result_key),
-                )
-            except Exception:
-                st.info("Preview not available. Use the S3 path above.")
-        else:
-            status.error(
-                "Timed out or processing did not complete. Verify permissions, bucket name, and check CloudWatch logs."
-            )
-        st.stop()
+            line = latest_log_line(region or None, log_groups)
+            if line:
+                log_box.caption(f"Last log: {line.strip()}")
 
-    # size guard (non-S3-URI flow)
-    if uploaded.size > TARGET_MAX_SIZE_GB * 1024 * 1024 * 1024:
-        st.error(f"File exceeds {TARGET_MAX_SIZE_GB} GB limit.")
-        st.stop()
+            done = sum(1 for r in records if r["status"] in ("done", "failed", "timeout"))
+            overall.progress(done / len(records), text=f"Completed {done}/{len(records)}")
+            _render_status_list(records)
 
-    # Write to a temp path on disk
-    tmpdir = tempfile.mkdtemp(prefix="hl_upload_")
-    temp_path = os.path.join(tmpdir, uploaded.name)
+            if all(r["status"] != "processing" for r in records):
+                break
+            if time.time() > deadline:
+                for r in records:
+                    if r["status"] == "processing":
+                        r["status"] = "timeout"
+                        r["note"] = "timed out waiting for result; check CloudWatch logs"
+                _render_status_list(records)
+                break
+            time.sleep(POLL_SECONDS)
 
-    if not check_free_space(temp_path, uploaded.size * 2):  # buffer + temp
-        st.error("Insufficient disk space for staging upload.")
-        st.stop()
-
-    status.info("Saving file to disk…")
-    # If using local path mode, detect and hardlink/copy instead of re-reading into memory
-    source_was_local = False
-    try:
-        # Best-effort: if user provided local path and chose to use it
-        if "local_path" in locals() and use_local and local_path:
-            lp = Path(local_path).expanduser().resolve()
-            if lp.exists() and lp.is_file():
-                source_was_local = True
-                try:
-                    os.link(str(lp), temp_path)
-                except Exception:
-                    shutil.copy2(str(lp), temp_path)
-                size_written = os.path.getsize(temp_path)
-            else:
-                uploaded.seek(0)
-                size_written = save_uploaded_to_disk(uploaded, temp_path)
-        else:
-            uploaded.seek(0)
-            size_written = save_uploaded_to_disk(uploaded, temp_path)
-    except Exception:
-        uploaded.seek(0)
-        size_written = save_uploaded_to_disk(uploaded, temp_path)
-
-    if size_written != uploaded.size:
-        st.warning("Size mismatch after save; proceeding but results may vary.")
-
-    # Begin multipart upload in a worker thread; update UI from the main thread.
-    s3 = get_s3_client(region or None)
-
-    q: Queue = Queue()
-    result = {"key": None, "error": None}
-
-    def on_progress(ps):
-        # Called from s3transfer threads. Do NOT touch Streamlit here.
-        # Instead, queue the latest progress state for the main thread to render.
-        try:
-            q.put(ps, block=False)
-        except Exception:
-            pass
-
-    def worker():
-        try:
-            k = multipart_upload(
-                s3,
-                bucket=bucket,
-                src_path=temp_path,
-                prompt=prompt.strip() or None,
-                on_progress=on_progress,
-                dry_run=dry_run,
-            )
-            result["key"] = k
-        except Exception:
-            result["error"] = traceback.format_exc()
-
-    status.info("Uploading to S3…")
-    t = Thread(target=worker, daemon=True)
-    t.start()
-
-    last_update = time.time()
-    while t.is_alive():
-        try:
-            ps = q.get(timeout=0.2)
-            pct = ps.pct / 100.0
-            eta = f"ETA {timedelta(seconds=int(ps.eta))}" if ps.eta else "Estimating…"
-            progress.progress(
-                pct, text=f"Uploading {ps.filename}: {ps.pct:.1f}% • {eta}"
-            )
-            # light debug heartbeat each ~3s
-            if time.time() - last_update > 3:
-                debug_box.caption("Uploading… (UI updated from main thread)")
-                last_update = time.time()
-        except Empty:
-            # keep UI responsive
-            pass
-        except Exception as e:
-            debug_box.error(f"Progress update error: {e}")
-            break
-        # Yield to Streamlit
-        time.sleep(0.05)
-
-    t.join(timeout=1)
-    if result["error"]:
-        status.error("Upload failed.")
-        with st.expander("Show error details"):
-            st.code(result["error"], language="text")
-        st.stop()
-    key = result["key"]
-    progress.progress(1.0, text="Upload complete.")
-
-    # Polling phase with pipeline progress
-    status.info("Processing in backend… This can take several minutes.")
-    log_box = st.empty()
-    stack = stack_name or os.getenv("STACK_NAME", "HighlightProcessorStack")
-    processing_start_time = time.time()
-
-    result_key = result_key_for_input(key)
-    found = False
-    while True:
-        st_status: PipelineStatus = get_pipeline_status(
-            region or None, stack, key, start_time=processing_start_time
-        )
-        st_status = _normalize_status(st_status)
-        pct = st_status.overall_pct() / 100.0
-        _render_stages(st_status)
-        progress.progress(pct, text=f"Processing… {int(pct*100)}%")
-
-        log_line = latest_log_line(
-            region or None,
-            [
-                f"/aws/lambda/{stack}-VideoTriggerLambda",
-                f"/ecs/video-processor-{stack}",
-            ],
-        )
-        if log_line:
-            log_box.caption(f"Last log: {log_line.strip()}")
-
-        try:
-            found = object_exists(s3, bucket, result_key)
-        except Exception:
-            found = False
-
-        if found or st_status.finished_success:
-            break
-        time.sleep(5)
-
-    if (not found) and st_status.finished_success:
-        t0 = time.time()
-        while time.time() - t0 < 60:
-            try:
-                if object_exists(s3, bucket, result_key):
-                    found = True
-                    break
-            except Exception:
-                pass
-            time.sleep(2)
-
-    if found:
-        # Force-finish UI since the result object exists even if logs didn't include the final message
-        try:
-            st_status.finished_success = True  # type: ignore[name-defined]
-            st_status = _normalize_status(st_status)  # type: ignore[name-defined]
-            _render_stages(st_status)  # type: ignore[name-defined]
-        except Exception:
-            pass
-        progress.progress(1.0, text="Processing… 100%")
-        status.success("Highlights ready!")
-        s3_path = f"s3://{bucket}/{result_key}"
-        st.write(s3_path)
-        try:
-            obj = s3.get_object(Bucket=bucket, Key=result_key)
-            data = obj["Body"].read()
-            st.video(data)
-            st.download_button(
-                "Download highlights",
-                data=data,
-                file_name=os.path.basename(result_key),
-            )
-        except Exception:
-            st.info("Preview not available. Use the S3 path above.")
+    # ---- Results: preview + download per finished video. ----
+    n_done = sum(1 for r in records if r["status"] == "done")
+    if n_done == len(records):
+        status.success(f"All {n_done} highlight video(s) ready!")
     else:
-        status.error(
-            "Timed out or processing did not complete. Verify permissions, bucket name, and check CloudWatch logs."
-        )
+        status.warning(f"{n_done}/{len(records)} completed. See details below.")
+
+    st.subheader("Results")
+    for r in records:
+        icon = _STATUS_ICON.get(r["status"], "⏳")
+        with st.expander(f"{icon} {r['label']} — {r['status']}", expanded=r["status"] == "done"):
+            if r["status"] == "done":
+                s3_path = f"s3://{bucket}/{r['result_key']}"
+                st.write(s3_path)
+                try:
+                    # Presigned URL avoids loading every result fully into memory.
+                    url = s3.generate_presigned_url(
+                        "get_object",
+                        Params={"Bucket": bucket, "Key": r["result_key"]},
+                        ExpiresIn=3600,
+                    )
+                    st.video(url)
+                    st.markdown(f"[Download {os.path.basename(r['result_key'])}]({url})")
+                except Exception:
+                    st.info("Preview not available. Use the S3 path above.")
+            elif r["status"] == "failed":
+                st.error(r.get("note") or "Upload failed.")
+            elif r["status"] == "timeout":
+                st.warning(r.get("note") or "Timed out. Verify permissions and check CloudWatch logs.")
+            else:
+                st.info("Still processing.")
