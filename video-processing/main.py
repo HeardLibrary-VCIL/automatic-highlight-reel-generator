@@ -154,34 +154,61 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
     # otherwise collide on the job name and raise a Transcribe ConflictException.
     job_name = f"scua-{stem}-{int(time.time())}-{uuid.uuid4().hex[:8]}"[:200]
 
-    # --- A. transcribe straight from S3 (diarized) ---
+    # --- A. transcribe straight from S3 (diarized) — with cache check ---
     t0 = time.time()
     transcribe_client = _boto3.client("transcribe", region_name=REGION)
     s3_client = _boto3.client("s3", region_name=REGION)
-    # Transcribe only reads a fixed set of containers. When the upload isn't one of
-    # them (avi/mkv/wmv/ts/...), extract the audio locally (we already have the file)
-    # to an mp4/aac clip and transcribe THAT, so every accepted upload gets a real
-    # transcript instead of silently degrading to visual-only segmentation. The task
-    # role can write edit/* and Transcribe can read it back with the same role.
-    media_uri = f"s3://{s3_bucket}/{s3_key}"
-    if media_format(s3_key) is None:
-        audio_key = f"edit/{stem}.transcribe.mp4"
-        audio_path = Path(local_video_path).with_name(f"{stem}.transcribe.mp4")
-        extract_audio(str(local_video_path), str(audio_path))
-        s3_client.upload_file(str(audio_path), s3_bucket, audio_key)
-        media_uri = f"s3://{s3_bucket}/{audio_key}"
-        log.info(f"[A] {Path(s3_key).suffix or '(no ext)'} not Transcribe-native; "
-                 f"extracted audio -> s3://{s3_bucket}/{audio_key}")
-    log.info(f"[A] Transcribe job {job_name} on {media_uri}")
-    start_job(transcribe_client, media_uri, job_name=job_name,
-              language=TRANSCRIBE_LANGUAGE, max_speakers=MAX_SPEAKERS)
-    job = wait(transcribe_client, job_name)
-    turns = to_speaker_turns(fetch_result(job, s3_client))
-    speakers = sorted({t["speaker"] for t in turns})
-    log.info(f"[A] {len(turns)} speaker turns, {len(speakers)} speakers "
-             f"in {time.time() - t0:.1f}s")
+    transcript_cache_key = f"transcript/{stem}.json"
+
+    # Check for cached transcript first (saves ~$0.72 + 3-5 min per re-run)
+    turns = None
+    try:
+        resp = s3_client.get_object(Bucket=s3_bucket, Key=transcript_cache_key)
+        turns = json.loads(resp["Body"].read().decode("utf-8"))
+        if turns:
+            speakers = sorted({t["speaker"] for t in turns})
+            log.info(f"[A] Loaded cached transcript from s3://{s3_bucket}/{transcript_cache_key} "
+                     f"({len(turns)} turns, {len(speakers)} speakers)")
+    except Exception:
+        turns = None
+
     if not turns:
-        raise RuntimeError("Transcribe returned no speech turns")
+        # No cache — run Transcribe
+        # Transcribe only reads a fixed set of containers. When the upload isn't one of
+        # them (avi/mkv/wmv/ts/...), extract the audio locally (we already have the file)
+        # to an mp4/aac clip and transcribe THAT, so every accepted upload gets a real
+        # transcript instead of silently degrading to visual-only segmentation.
+        media_uri = f"s3://{s3_bucket}/{s3_key}"
+        if media_format(s3_key) is None:
+            audio_key = f"edit/{stem}.transcribe.mp4"
+            audio_path = Path(local_video_path).with_name(f"{stem}.transcribe.mp4")
+            extract_audio(str(local_video_path), str(audio_path))
+            s3_client.upload_file(str(audio_path), s3_bucket, audio_key)
+            media_uri = f"s3://{s3_bucket}/{audio_key}"
+            log.info(f"[A] {Path(s3_key).suffix or '(no ext)'} not Transcribe-native; "
+                     f"extracted audio -> s3://{s3_bucket}/{audio_key}")
+        log.info(f"[A] Transcribe job {job_name} on {media_uri}")
+        start_job(transcribe_client, media_uri, job_name=job_name,
+                  language=TRANSCRIBE_LANGUAGE, max_speakers=MAX_SPEAKERS)
+        job = wait(transcribe_client, job_name)
+        turns = to_speaker_turns(fetch_result(job, s3_client))
+        speakers = sorted({t["speaker"] for t in turns})
+        log.info(f"[A] {len(turns)} speaker turns, {len(speakers)} speakers "
+                 f"in {time.time() - t0:.1f}s")
+        if not turns:
+            raise RuntimeError("Transcribe returned no speech turns")
+        # Cache the transcript + VTT for future re-runs
+        try:
+            s3_client.put_object(Bucket=s3_bucket, Key=transcript_cache_key,
+                                 Body=json.dumps(turns, indent=2).encode("utf-8"),
+                                 ContentType="application/json")
+            s3_client.put_object(Bucket=s3_bucket,
+                                 Key=transcript_cache_key.replace(".json", ".vtt"),
+                                 Body=turns_to_vtt(turns).encode("utf-8"),
+                                 ContentType="text/vtt")
+            log.info(f"[A] Cached transcript + VTT to s3://{s3_bucket}/{transcript_cache_key}")
+        except Exception as cache_err:
+            log.warning(f"[A] Could not cache transcript: {cache_err}")
 
     # --- B. shots + join words onto them ---
     t0 = time.time()
