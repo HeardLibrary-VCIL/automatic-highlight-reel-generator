@@ -237,18 +237,7 @@ def lambda_handler(event, context):
                 continue
             
             logger.info(f"Valid video file detected: {key} ({file_info['size']} bytes, {file_info['content_type']})")
-            
-            # Extract custom prompt from metadata
-            metadata = file_info['metadata']
-            custom_prompt = metadata.get('prompt')
-            
-            if custom_prompt:
-                logger.info(f"Using custom prompt from metadata: {custom_prompt}")
-            else:
-                # Use default prompt if no metadata provided
-                custom_prompt = os.environ.get('EVENT_PROMPT', '<image> Is there a person in the air jumping into the water?')
-                logger.info(f"Using default prompt: {custom_prompt}")
-            
+
             # Get environment variables
             cluster = os.environ['CLUSTER_NAME']
             task_definition = os.environ['TASK_DEFINITION']
@@ -287,10 +276,6 @@ def lambda_handler(event, context):
                                 {
                                     'name': 'S3_KEY',
                                     'value': key
-                                },
-                                {
-                                    'name': 'EVENT_PROMPT',
-                                    'value': custom_prompt
                                 }
                             ]
                         }
@@ -326,8 +311,7 @@ def lambda_handler(event, context):
             processed_files.append({
                 'key': key,
                 'task_arn': task_arn,
-                'file_size': file_info['size'],
-                'prompt': custom_prompt
+                'file_size': file_info['size']
             })
         
         # Prepare response

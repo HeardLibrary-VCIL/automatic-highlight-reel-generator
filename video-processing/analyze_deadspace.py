@@ -323,7 +323,18 @@ def analyze(input_video=None, *, from_log=None, mode="black", merge_gap=0.5,
         if not input_video:
             raise ValueError("analyze() needs input_video or from_log")
         duration, regions = probe_video(input_video, **probe_kwargs)
+    # A (near-)silent or absent audio track makes silencedetect flag the WHOLE file
+    # as silence -- which isn't dead space, just no audio (e.g. a game clip with no
+    # commentary). Left in, it triggers the whole-file-dead guard and collapses the
+    # trim to NEEDS_REVIEW. If silence blankets the file, drop it so the trim is
+    # decided by the visual detectors (black/bars/snow) only.
+    silence_cov = sum(r.end - r.start for r in regions if r.kind == "silence")
+    silent_track = bool(duration) and silence_cov >= 0.98 * duration
+    if silent_track:
+        regions = [r for r in regions if r.kind != "silence"]
     cs, ce, status, notes = propose_window(regions, duration, merge_gap, edge_tol, min_keep, mode)
+    if silent_track:
+        notes.append("audio is (near-)silent or absent; ignored silence and trimmed on visual cues only")
     return Proposal(duration, cs, ce, status, notes, regions)
 
 

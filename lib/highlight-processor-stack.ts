@@ -3,7 +3,6 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
-import * as s3n from 'aws-cdk-lib/aws-s3-notifications';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
@@ -40,7 +39,7 @@ export class HighlightProcessorStack extends cdk.Stack {
     });
 
     // ═══════════════════════════════════════════════════════════════════════
-    // ECS CLUSTER + GPU AUTO SCALING (min 0 for cost savings)
+    // ECS CLUSTER + CPU AUTO SCALING (min 0 for cost savings)
     // ═══════════════════════════════════════════════════════════════════════
     const cluster = new ecs.Cluster(this, 'VideoProcessorCluster', {
       vpc,
@@ -49,8 +48,7 @@ export class HighlightProcessorStack extends cdk.Stack {
 
     const autoScalingGroup = new autoscaling.AutoScalingGroup(this, 'VideoProcessorASG', {
       vpc,
-      // CPU instance for dead-space detection (ffmpeg-only, no GPU needed)
-      // Switch back to G4DN when GPU quota is approved for VLM content search
+
       instanceType: ec2.InstanceType.of(ec2.InstanceClass.C5, ec2.InstanceSize.XLARGE),
       machineImage: ecs.EcsOptimizedImage.amazonLinux2023(),
       minCapacity: 0,
@@ -163,14 +161,10 @@ export class HighlightProcessorStack extends cdk.Stack {
 
     taskDefinition.addContainer('video-processor', {
       image: ecs.ContainerImage.fromAsset('./video-processing', {
-        platform: Platform.LINUX_AMD64,
-        buildArgs: {
-          'HUGGINGFACE_TOKEN': process.env.HUGGINGFACE_TOKEN || ''
-        }
+        platform: Platform.LINUX_AMD64
       }),
       memoryLimitMiB: 7168,  // ~7GB for c5.xlarge (8GiB total)
       cpu: 4096,             // 4 vCPUs for c5.xlarge
-      // gpuCount: 1,        // Re-enable when switching back to G4DN
       logging: ecs.LogDrivers.awsLogs({
         streamPrefix: 'video-processor',
         logGroup,
@@ -255,6 +249,10 @@ import boto3
 import cfnresponse
 import json
 
+# Stable physical id so CloudFormation does IN-PLACE updates (never a replacement,
+# whose delete-of-the-old-resource would wipe the config the new one just wrote).
+STABLE_ID = 'scua-s3-notification-config'
+
 def handler(event, context):
     try:
         s3 = boto3.client('s3')
@@ -267,12 +265,15 @@ def handler(event, context):
             existing = s3.get_bucket_notification_configuration(Bucket=bucket)
             existing.pop('ResponseMetadata', None)
 
-            # Remove any existing notifications with our IDs
+            # Remove any config that targets OUR Lambda (any id — covers legacy ids
+            # like scua-trim-request-trigger) so we never leave an overlapping edit/
+            # rule behind, plus our known ids, before re-adding a clean set.
             lambda_configs = existing.get('LambdaFunctionConfigurations', [])
             our_ids = {notification_id, notification_id + '-trim', notification_id + '-segment'}
-            lambda_configs = [c for c in lambda_configs if c.get('Id') not in our_ids]
+            lambda_configs = [c for c in lambda_configs
+                              if c.get('LambdaFunctionArn') != lambda_arn and c.get('Id') not in our_ids]
 
-            # Add our notifications
+            # video/ uploads -> segment detection.
             lambda_configs.append({
                 'Id': notification_id,
                 'LambdaFunctionArn': lambda_arn,
@@ -285,6 +286,8 @@ def handler(event, context):
                     }
                 }
             })
+
+            # edit/*_trim_request.json -> trim mode
             lambda_configs.append({
                 'Id': notification_id + '-trim',
                 'LambdaFunctionArn': lambda_arn,
@@ -298,6 +301,8 @@ def handler(event, context):
                     }
                 }
             })
+
+            # edit/*_segment_request.json -> re-segmentation
             lambda_configs.append({
                 'Id': notification_id + '-segment',
                 'LambdaFunctionArn': lambda_arn,
@@ -322,10 +327,10 @@ def handler(event, context):
             existing['LambdaFunctionConfigurations'] = lambda_configs
             s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
 
-        cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+        cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, STABLE_ID)
     except Exception as e:
         print(f"Error: {e}")
-        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+        cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, STABLE_ID)
 `),
     });
 
