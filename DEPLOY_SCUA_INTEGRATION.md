@@ -41,7 +41,6 @@ Trim request → Lambda → ECS Task (MODE=trim) → edit/{id}_trimmed.mp4
 - Docker running locally
 - AWS CLI configured with a profile (e.g., `scua-video`)
 - The SCUA-Video-Editing Amplify app deployed (you need the bucket name)
-- Anthropic API key
 
 ## Step 1: Get the Amplify Bucket Name
 
@@ -52,39 +51,20 @@ cat ../SCUA-Video-Editing/amplify_outputs.json | jq -r '.storage.bucket_name'
 
 Returns something like: `amplify-d3f0pl9vo50wn1-ma-scuavideostoragebucket58-9nitsvxrhdt1`
 
-## Step 2: Store the Anthropic API Key
-
-One-time setup — the ECS task reads this at startup:
-
-```bash
-aws secretsmanager create-secret \
-  --name scua/anthropic-api-key \
-  --secret-string 'sk-ant-api03-...' \
-  --profile scua-video
-```
-
-To update an existing key:
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id scua/anthropic-api-key \
-  --secret-string 'sk-ant-api03-NEW-KEY' \
-  --profile scua-video
-```
-
-## Step 3: Install CDK Dependencies
+## Step 2: Deploy CDK Dependencies
 
 ```bash
 cd Project2/automatic-highlight-reel-generator
 npm install
 ```
 
-## Step 4: Bootstrap CDK (first time only)
+## Step 3: Bootstrap CDK (first time only)
 
 ```bash
 cdk bootstrap aws://ACCOUNT_ID/us-east-1 --profile scua-video
 ```
 
-## Step 5: Deploy
+## Step 4: Deploy
 
 ```bash
 cdk deploy \
@@ -98,8 +78,7 @@ This creates:
 - Docker image built from `video-processing/` (pushed to ECR)
 - Lambda trigger for S3 `video/*` uploads and `edit/*_trim_request.json`
 - S3 notification config on the Amplify bucket
-- Secrets Manager access for `ANTHROPIC_API_KEY`
-- IAM roles (task: S3 + Transcribe; execution: ECR + Secrets Manager)
+- IAM roles (task: S3 + Transcribe + Bedrock; execution: ECR)
 - CloudWatch log group: `/ecs/scua-video-processor`
 - Bucket lifecycle rule (noncurrent version cleanup)
 
@@ -190,18 +169,7 @@ Infrastructure idle cost: ~$33/month (NAT gateway). EC2 scales to 0 when no task
 
 ## Instance Type
 
-Currently `c5.xlarge` (4 vCPU, 8GB RAM, ~$0.17/hr). No GPU needed — all AI runs via API calls (Anthropic + Transcribe), not local inference.
-
-## Updating the Anthropic API Key
-
-```bash
-aws secretsmanager put-secret-value \
-  --secret-id scua/anthropic-api-key \
-  --secret-string 'sk-ant-NEW-KEY' \
-  --profile scua-video
-```
-
-No redeploy needed — the next ECS task picks up the new key automatically.
+Currently `c5.xlarge` (4 vCPU, 8GB RAM, ~$0.17/hr). No GPU needed — all AI runs via Bedrock + Transcribe using the ECS task role, not local inference.
 
 ## Updating the Pipeline Code
 
@@ -226,8 +194,8 @@ CDK rebuilds the Docker image and updates the ECS task definition. Running tasks
 - Check that the video has an audio track
 
 **Content labeling fails:**
-- Verify the secret exists: `aws secretsmanager get-secret-value --secret-id scua/anthropic-api-key --profile scua-video`
-- Check CloudWatch logs for API errors
+- Check CloudWatch logs for Bedrock API errors
+- Verify the ECS task role has `bedrock:InvokeModel` permission
 - Pipeline continues without labels (segments output as type "I" instead of "C")
 
 **No segments appearing in Editor:**
