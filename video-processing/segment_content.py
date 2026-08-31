@@ -20,8 +20,8 @@ Design mirrors analyze_deadspace.py on purpose:
 
 Why a model (and not ffmpeg signals): telling "interview" apart from "political
 ad" is content understanding, which the model-free detectors can't do. We use
-Claude's multimodal API rather than a self-hosted VLM (e.g. PaliGemma) so there
-is no GPU to run -- the model runs on Anthropic's side, this process only needs
+Claude's multimodal API via Amazon Bedrock so there
+is no GPU to run -- the model runs on Bedrock's side, this process only needs
 a CPU + network. Open-ended labels: the model names the type; a running
 vocabulary of already-used labels is fed back each call to curb label drift.
 
@@ -189,8 +189,10 @@ def classify_window(client, jpegs, model=CLASSIFY_MODEL, interval=30.0,
                                             "media_type": "image/jpeg", "data": j}}
                for j in jpegs]
     content.append({"type": "text", "text": prompt})
-    resp = client.messages.create(
-        model=model, max_tokens=24, messages=[{"role": "user", "content": content}])
+    from bedrock import create_with_retry
+    resp = create_with_retry(
+        client, model=model, max_tokens=24,
+        messages=[{"role": "user", "content": content}])
     text = "".join(b.text for b in resp.content if b.type == "text").strip()
     left, _, right = text.partition("/")
     category = _canonical(left, categories)
@@ -231,7 +233,9 @@ AB_PROMPT = (
 def classify_ab(client, jpeg_b64, a_label, b_label, model=CLASSIFY_MODEL) -> str:
     """Forced choice: does this frame show a_label (A) or b_label (B)?
     Returns whichever label string the model picked."""
-    resp = client.messages.create(
+    from bedrock import create_with_retry
+    resp = create_with_retry(
+        client,
         model=model,
         max_tokens=8,
         messages=[{"role": "user", "content": [

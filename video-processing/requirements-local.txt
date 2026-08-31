@@ -1,7 +1,0 @@
-# Local (non-AWS) requirements for run_local.py.
-# Use Python 3.11 or 3.12 — the pinned scientific stack (numpy/pandas/opencv)
-# has no wheels for 3.14, and torch supports <=3.13.
-# On Apple Silicon, `pip install torch` ships an MPS-enabled build by default.
-# boto3/botocore come in via requirements.txt but are unused by run_local.py.
--r requirements.txt
-torch>=2.2

@@ -24,9 +24,9 @@ import cv2
 import numpy as np
 
 # tunables (set against synthetic snow vs real program below)
-LAP_MIN = 600.0      # Laplacian variance floor
-SMOOTH_MAX = 0.06    # max fraction of smooth (flat) blocks
-MAD_MIN = 28.0       # min mean-abs-diff to the next frame
+LAP_MIN = 400.0      # Laplacian variance floor (lowered for noisy VHS transitions)
+SMOOTH_MAX = 0.10    # max fraction of smooth (flat) blocks (raised for partial-signal fuzz)
+MAD_MIN = 20.0       # min mean-abs-diff to the next frame (lowered for low-contrast noise)
 BLOCK = 16
 SMOOTH_STD = 12.0    # a block with std below this is "smooth"
 
@@ -56,21 +56,61 @@ def snow_score(prev_gray, gray) -> dict:
 
 
 def scan_range(path, start, end, step=1.0):
-    cap = cv2.VideoCapture(path)
+    """Scan [start,end] for snow. Streams frame PAIRS via ffmpeg (no per-sample
+    cv2 seeking, which is very slow on large H.264 files). At each sample point we
+    grab two consecutive native frames so the frame-to-frame diff (mad) — the
+    signal that separates snow from a frozen frame — is measured at native rate.
+
+    Implementation: ask ffmpeg for 2 frames every `step` seconds using the select
+    filter, streamed as raw gray. Pairs arrive back-to-back in the stream."""
+    import subprocess
+    W = H = 256
+    span = max(0.0, end - start)
+    if span <= 0:
+        return [], []
+    # select two consecutive frames at the start of each `step` window:
+    #   mod(t,step) picks the window; grab the first 2 frames of each window via
+    #   a frame-index trick is complex, so instead sample at 2 frames per step by
+    #   requesting fps=2/step won't give ADJACENT frames. Use select='lt(mod(n,N),2)'
+    #   where N = step*native_fps to take the first 2 frames of each step-block.
+    # Get native fps
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate", "-of",
+             "default=nokey=1:noprint_wrappers=1", path],
+            stderr=subprocess.DEVNULL).decode().strip()
+        num, den = out.split("/") if "/" in out else (out, "1")
+        native_fps = float(num) / float(den) if float(den) else 25.0
+    except Exception:
+        native_fps = 25.0
+    N = max(2, int(round(step * native_fps)))
+
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+           "-ss", f"{start:.3f}", "-t", f"{span:.3f}", "-i", path,
+           "-vf", f"select='lt(mod(n\\,{N})\\,2)',scale={W}:{H},format=gray",
+           "-vsync", "vfr", "-f", "rawvideo", "pipe:1"]
+    frame_bytes = W * H
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
     snow_ts, results = [], []
-    t = max(0.0, start)
-    while t <= end:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
-        ok_a, a = cap.read()
-        ok_b, b = cap.read()        # the very next frame (native-rate neighbor)
-        if not (ok_a and ok_b):
+    idx = 0
+    import numpy as _np
+    while True:
+        buf_a = proc.stdout.read(frame_bytes)
+        buf_b = proc.stdout.read(frame_bytes)
+        if len(buf_a) < frame_bytes or len(buf_b) < frame_bytes:
             break
-        sc = snow_score(_center_gray(a), _center_gray(b))
-        results.append((round(t, 1), sc))
+        a = _np.frombuffer(buf_a, dtype=_np.uint8).reshape(H, W)
+        b = _np.frombuffer(buf_b, dtype=_np.uint8).reshape(H, W)
+        t = round(start + idx * step, 1)
+        sc = snow_score(a, b)
+        results.append((t, sc))
         if sc["is_snow"]:
-            snow_ts.append(round(t, 1))
-        t += step
-    cap.release()
+            snow_ts.append(t)
+        idx += 1
+    proc.stdout.close()
+    proc.wait()
     return snow_ts, results
 
 

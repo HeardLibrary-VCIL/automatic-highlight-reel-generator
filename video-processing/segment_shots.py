@@ -107,15 +107,35 @@ def label_shots(path, shots, model=CLASSIFY_MODEL, frames_per_shot=3,
                 max_width=768, categories=None) -> list:
     """Classify each shot into the closed set (or OTHER). Returns
     [(shot_start, category, description)]. One VLM call per shot (Bedrock)."""
+    import os
+    import time
     from bedrock import make_client
     client = make_client()
+    # The applied cross-region RPM for this Sonnet inference profile is ~10/min
+    # (confirmed: a burst of 6 calls in ~6s all returned 429). Pace at one call
+    # every ~6.5s to stay just under it. classify_window ALSO retries with
+    # exponential backoff, so any call that still trips the limit (e.g. when
+    # another task shares the quota) is retried rather than aborting the run.
+    # Tunable via BEDROCK_CALL_DELAY (lower it if the quota is raised).
+    call_delay = float(os.environ.get("BEDROCK_CALL_DELAY", "6.5"))
     cap = cv2.VideoCapture(path)
     labeled = []
-    for ss, ee in shots:
+    for i, (ss, ee) in enumerate(shots):
         jpegs = sample_shot(cap, ss, ee, frames_per_shot, max_width)
         if not jpegs:
             continue
-        cat, desc = classify_window(client, jpegs, model, ee - ss, categories)
+        if i > 0 and call_delay > 0:
+            time.sleep(call_delay)
+        try:
+            cat, desc = classify_window(client, jpegs, model, ee - ss, categories)
+        except Exception as e:
+            # A single shot that still fails after retries must NOT discard every
+            # other successfully-labeled shot. Skip it and continue; the segment
+            # gap is filled by its neighbors during coalescing. Only if NO shot
+            # labels does the caller fall back to dead-space-only.
+            print(f"  [{ss:8.2f} -> {ee:8.2f}] classify failed, skipping: {e}",
+                  file=sys.stderr)
+            continue
         labeled.append((ss, cat, desc))
         shown = cat + (f" ({desc})" if cat == OTHER and desc else "")
         print(f"  [{ss:8.2f} -> {ee:8.2f}] ({len(jpegs)}f) {shown}", file=sys.stderr)

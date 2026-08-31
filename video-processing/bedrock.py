@@ -21,3 +21,28 @@ def make_client(region: str = BEDROCK_REGION):
     anthropic.Anthropic(), so callers only swap the constructor."""
     from anthropic import AnthropicBedrock
     return AnthropicBedrock(aws_region=region)
+
+
+def create_with_retry(client, *, max_retries=6, base_delay=2.0, **kwargs):
+    """client.messages.create with exponential backoff on Bedrock throttling.
+
+    A long video produces one vision call per shot; without backoff a burst of
+    calls trips Bedrock's rate limit (HTTP 429) and the whole segmentation aborts
+    to dead-space-only. Retries on 429 / throttling / overloaded with exponential
+    backoff + jitter so labeling completes instead of failing the run."""
+    import time
+    import random
+
+    for attempt in range(max_retries + 1):
+        try:
+            return client.messages.create(**kwargs)
+        except Exception as e:
+            msg = str(e).lower()
+            status = getattr(e, "status_code", None)
+            throttled = (status == 429 or "429" in msg or "too many requests" in msg
+                         or "throttl" in msg or "overloaded" in msg
+                         or "rate" in msg and "limit" in msg)
+            if not throttled or attempt == max_retries:
+                raise
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 1.0)
+            time.sleep(delay)

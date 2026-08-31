@@ -129,7 +129,96 @@ def extract_audio(input_video: str, output_audio: str) -> str:
     return output_audio
 
 
-def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
+def has_audio_stream(input_video: str) -> bool:
+    """True if the video has at least one audio stream. Silent videos (e.g. a
+    game clip with no commentary) have none — we skip transcription for those
+    and segment visually, avoiding a wasted/failing Transcribe cycle."""
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=index", "-of", "csv=p=0", input_video],
+            stderr=subprocess.DEVNULL).decode().strip()
+        return bool(out)
+    except Exception:
+        return False
+
+
+def get_transcript_turns(local_video_path, s3_bucket, s3_key):
+    """Transcribe the video (or load cached transcript). Returns diarized turns:
+    a list of {"start","end","speaker","text"}. Cached to transcript/{stem}.json so
+    it only runs Transcribe once even though both the dead-space pre-check and the
+    fusion segmentation need it. Returns [] if no usable audio/speech."""
+    import boto3 as _boto3
+    from transcribe import start_job, wait, fetch_result, to_speaker_turns, media_format
+
+    stem = Path(s3_key).name.rsplit(".", 1)[0]
+    s3_client = _boto3.client("s3", region_name=REGION)
+    transcript_cache_key = f"transcript/{stem}.json"
+
+    # Cache check
+    try:
+        resp = s3_client.get_object(Bucket=s3_bucket, Key=transcript_cache_key)
+        turns = json.loads(resp["Body"].read().decode("utf-8"))
+        if turns:
+            log.info(f"[A] Loaded cached transcript ({len(turns)} turns)")
+            return turns
+    except Exception:
+        pass
+
+    transcribe_client = _boto3.client("transcribe", region_name=REGION)
+    job_name = f"scua-{stem}-{int(time.time())}-{uuid.uuid4().hex[:8]}"[:200]
+    media_uri = f"s3://{s3_bucket}/{s3_key}"
+    if media_format(s3_key) is None:
+        audio_key = f"edit/{stem}.transcribe.mp4"
+        audio_path = Path(local_video_path).with_name(f"{stem}.transcribe.mp4")
+        extract_audio(str(local_video_path), str(audio_path))
+        s3_client.upload_file(str(audio_path), s3_bucket, audio_key)
+        media_uri = f"s3://{s3_bucket}/{audio_key}"
+        log.info(f"[A] extracted audio -> s3://{s3_bucket}/{audio_key}")
+    log.info(f"[A] Transcribe job {job_name} on {media_uri}")
+    start_job(transcribe_client, media_uri, job_name=job_name,
+              language=TRANSCRIBE_LANGUAGE, max_speakers=MAX_SPEAKERS)
+    job = wait(transcribe_client, job_name)
+    turns = to_speaker_turns(fetch_result(job, s3_client))
+    if not turns:
+        return []
+    # Cache transcript + VTT
+    try:
+        s3_client.put_object(Bucket=s3_bucket, Key=transcript_cache_key,
+                             Body=json.dumps(turns, indent=2).encode("utf-8"),
+                             ContentType="application/json")
+        s3_client.put_object(Bucket=s3_bucket,
+                             Key=transcript_cache_key.replace(".json", ".vtt"),
+                             Body=turns_to_vtt(turns).encode("utf-8"),
+                             ContentType="text/vtt")
+        log.info(f"[A] Cached transcript + VTT")
+    except Exception as cache_err:
+        log.warning(f"[A] Could not cache transcript: {cache_err}")
+    return turns
+
+
+def speech_windows_from_turns(turns, merge_gap=5.0):
+    """Collapse diarized turns into merged speech time windows [(start,end)].
+    Adjacent turns within merge_gap seconds are joined so brief pauses between
+    sentences don't fragment the windows.
+
+    merge_gap is deliberately small (5s): a longer gap between turns means a real
+    silent stretch (e.g. a black-screen filler or bars leader between segments),
+    which must NOT be absorbed into a speech window — otherwise the dead-space
+    veto would hide those mid-video dead spans. Only bridge true sentence pauses."""
+    if not turns:
+        return []
+    spans = sorted((float(t["start"]), float(t["end"])) for t in turns)
+    merged = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s - merged[-1][1] <= merge_gap:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return [(s, e) for s, e in merged]
+
+
+def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=None):
     """Stages A-D: transcribe -> shots+fuse -> discover taxonomy/topics -> label.
 
     Transcribe reads the ORIGINAL S3 object (the frontend already uploaded it), so
@@ -149,66 +238,14 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop):
     from bedrock import make_client
 
     stem = Path(s3_key).name.rsplit(".", 1)[0]
-    # A UUID suffix keeps the job name unique even if S3's at-least-once delivery (or a
-    # double-click) fires two runs for the same video in the same second -- which would
-    # otherwise collide on the job name and raise a Transcribe ConflictException.
-    job_name = f"scua-{stem}-{int(time.time())}-{uuid.uuid4().hex[:8]}"[:200]
-
-    # --- A. transcribe straight from S3 (diarized) — with cache check ---
-    t0 = time.time()
-    transcribe_client = _boto3.client("transcribe", region_name=REGION)
+    import boto3 as _boto3
     s3_client = _boto3.client("s3", region_name=REGION)
-    transcript_cache_key = f"transcript/{stem}.json"
 
-    # Check for cached transcript first (saves ~$0.72 + 3-5 min per re-run)
-    turns = None
-    try:
-        resp = s3_client.get_object(Bucket=s3_bucket, Key=transcript_cache_key)
-        turns = json.loads(resp["Body"].read().decode("utf-8"))
-        if turns:
-            speakers = sorted({t["speaker"] for t in turns})
-            log.info(f"[A] Loaded cached transcript from s3://{s3_bucket}/{transcript_cache_key} "
-                     f"({len(turns)} turns, {len(speakers)} speakers)")
-    except Exception:
-        turns = None
-
+    # --- A. transcribe straight from S3 (diarized) — reuse pre-fetched turns ---
+    if turns is None:
+        turns = get_transcript_turns(local_video_path, s3_bucket, s3_key)
     if not turns:
-        # No cache — run Transcribe
-        # Transcribe only reads a fixed set of containers. When the upload isn't one of
-        # them (avi/mkv/wmv/ts/...), extract the audio locally (we already have the file)
-        # to an mp4/aac clip and transcribe THAT, so every accepted upload gets a real
-        # transcript instead of silently degrading to visual-only segmentation.
-        media_uri = f"s3://{s3_bucket}/{s3_key}"
-        if media_format(s3_key) is None:
-            audio_key = f"edit/{stem}.transcribe.mp4"
-            audio_path = Path(local_video_path).with_name(f"{stem}.transcribe.mp4")
-            extract_audio(str(local_video_path), str(audio_path))
-            s3_client.upload_file(str(audio_path), s3_bucket, audio_key)
-            media_uri = f"s3://{s3_bucket}/{audio_key}"
-            log.info(f"[A] {Path(s3_key).suffix or '(no ext)'} not Transcribe-native; "
-                     f"extracted audio -> s3://{s3_bucket}/{audio_key}")
-        log.info(f"[A] Transcribe job {job_name} on {media_uri}")
-        start_job(transcribe_client, media_uri, job_name=job_name,
-                  language=TRANSCRIBE_LANGUAGE, max_speakers=MAX_SPEAKERS)
-        job = wait(transcribe_client, job_name)
-        turns = to_speaker_turns(fetch_result(job, s3_client))
-        speakers = sorted({t["speaker"] for t in turns})
-        log.info(f"[A] {len(turns)} speaker turns, {len(speakers)} speakers "
-                 f"in {time.time() - t0:.1f}s")
-        if not turns:
-            raise RuntimeError("Transcribe returned no speech turns")
-        # Cache the transcript + VTT for future re-runs
-        try:
-            s3_client.put_object(Bucket=s3_bucket, Key=transcript_cache_key,
-                                 Body=json.dumps(turns, indent=2).encode("utf-8"),
-                                 ContentType="application/json")
-            s3_client.put_object(Bucket=s3_bucket,
-                                 Key=transcript_cache_key.replace(".json", ".vtt"),
-                                 Body=turns_to_vtt(turns).encode("utf-8"),
-                                 ContentType="text/vtt")
-            log.info(f"[A] Cached transcript + VTT to s3://{s3_bucket}/{transcript_cache_key}")
-        except Exception as cache_err:
-            log.warning(f"[A] Could not cache transcript: {cache_err}")
+        raise RuntimeError("Transcribe returned no speech turns")
 
     # --- B. shots + join words onto them ---
     t0 = time.time()
@@ -316,8 +353,12 @@ def run_visual_segmentation(local_video_path, prop):
 
 
 def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
-                       turns=None) -> dict:
+                       turns=None, mid_dead_spans=None) -> dict:
     """Build a segment JSON matching SCUA Editor format.
+
+    `mid_dead_spans` are DeadSpan objects that fall BETWEEN content (e.g. a color
+    bars leader or black gap mid-program). They're inserted as "D" segments so the
+    Editor shows them; without this they'd be swallowed by the content window.
 
     `content_segments` are the fusion-pipeline dicts
     {start, end, label, name, speakers}; the Editor gets the specific `name` as
@@ -405,6 +446,47 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
                 "segment_type": "D",
                 "title": "Tail dead space (auto-detected)",
             })
+
+    # Inject mid-video dead spans (color bars leaders, black gaps between segments).
+    # These fall inside the content window, so they'd otherwise be hidden. For each
+    # mid dead span, carve it out of any overlapping content segment and add a "D"
+    # marker, then re-sort. Head/tail spans (at the very edges) are already handled
+    # above, so skip anything touching 0 or duration.
+    _DEAD_LABELS = {"bars": "Color bars (auto-detected)",
+                    "snow": "Video static/snow (auto-detected)",
+                    "black": "Black gap (auto-detected)",
+                    "white": "White gap (auto-detected)",
+                    "mixed": "Dead space (auto-detected)"}
+    if mid_dead_spans:
+        for ds in mid_dead_spans:
+            ds_start, ds_end = round(ds.start, 2), round(ds.end, 2)
+            if ds_end - ds_start < 0.5:
+                continue
+            carved = []
+            for seg in segments:
+                s0, s1 = seg["segment_start"], seg["segment_end"]
+                # No overlap → keep as-is
+                if ds_end <= s0 or ds_start >= s1:
+                    carved.append(seg)
+                    continue
+                # Overlap: keep the portion(s) of this segment outside the dead span
+                if s0 < ds_start:
+                    left = dict(seg); left["segment_end"] = ds_start
+                    carved.append(left)
+                if s1 > ds_end:
+                    right = dict(seg); right["segment_start"] = ds_end
+                    carved.append(right)
+                # (the middle, [ds_start,ds_end], is replaced by the dead marker below)
+            carved.append({
+                "segment_start": ds_start,
+                "segment_end": ds_end,
+                "segment_type": "D",
+                "title": _DEAD_LABELS.get(ds.kind, "Dead space (auto-detected)"),
+            })
+            segments = carved
+        # Re-sort and drop any zero/negative-length slivers from carving
+        segments = [s for s in segments if s["segment_end"] - s["segment_start"] > 0.05]
+        segments.sort(key=lambda s: s["segment_start"])
 
     # Guarantee the timeline is a gapless partition of [0, duration]: snap the first
     # segment to 0 and the last to the full duration, so a sub-second head/tail sliver
@@ -569,6 +651,32 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             log.info(f"Downloading video to {local_video_path}...")
             s3_client.download_file(s3_bucket, s3_key, str(local_video_path))
 
+            # --- STAGE 0: TRANSCRIBE FIRST (so speech can veto false dead space) ---
+            # VHS audio is low-level and often reads as "silent" to ffmpeg's
+            # silencedetect, so we can't rely on audio energy to tell dark program
+            # from dead space. The transcript is authoritative: if Transcribe found
+            # speech in a range, that range is content regardless of black frames.
+            prefetched_turns = None
+            speech_windows = []
+            video_has_audio = True
+            if _should_run_content_segmentation():
+                video_has_audio = has_audio_stream(str(local_video_path))
+                if not video_has_audio:
+                    # Silent video (e.g. a game clip with no commentary): skip
+                    # transcription entirely and let Stage 2 segment visually.
+                    log.info("--- Stage 0 (Transcribe): no audio stream; "
+                             "skipping transcription, will segment visually ---")
+                else:
+                    try:
+                        prefetched_turns = get_transcript_turns(
+                            local_video_path, s3_bucket, s3_key)
+                        speech_windows = speech_windows_from_turns(prefetched_turns)
+                        log.info(f"--- Stage 0 (Transcribe): {len(prefetched_turns or [])} turns, "
+                                 f"{len(speech_windows)} speech windows ---")
+                    except Exception as e:
+                        log.warning(f"Stage 0 transcription failed ({e}); "
+                                    f"dead-space runs without speech veto")
+
             # --- STAGE 1: PROBE ---
             stage1_start = time.time()
             if FULL_VIDEO_SCAN:
@@ -576,7 +684,8 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 full_analysis = analyze_full_video(
                     str(local_video_path), mode=TRIM_MODE,
                     merge_gap=MERGE_GAP, min_dead_dur=MIN_DEAD_DUR,
-                    min_content_dur=MIN_CONTENT_DUR, black_pic_th=BLACK_PIC_TH)
+                    min_content_dur=MIN_CONTENT_DUR, black_pic_th=BLACK_PIC_TH,
+                    speech_windows=speech_windows)
                 # Build a Proposal-compatible object for the rest of the pipeline
                 # using the first content span start and last content span end
                 if full_analysis.content_spans:
@@ -588,6 +697,15 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 prop = Proposal(full_analysis.duration, cs_start, cs_end,
                                 full_analysis.status, full_analysis.notes,
                                 full_analysis.regions)
+                # Mid-video dead spans (bars/black/snow between content) — these fall
+                # inside [cs_start, cs_end] so build_segment_json must inject them as
+                # "D" markers, else they're hidden inside the content window.
+                mid_dead_spans = [
+                    ds for ds in full_analysis.dead_spans
+                    if ds.start > cs_start + 0.5 and ds.end < cs_end - 0.5
+                ]
+                for ds in mid_dead_spans:
+                    log.info(f"  MID-DEAD [{ds.start:.1f}s -> {ds.end:.1f}s] {ds.kind}")
                 log.info(
                     f"--- Stage 1 (Full-video probe) completed in "
                     f"{time.time() - stage1_start:.2f}s ---\n"
@@ -600,6 +718,7 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             else:
                 prop = analyze(str(local_video_path), mode=TRIM_MODE)
                 full_analysis = None
+                mid_dead_spans = []  # head/tail-only mode has no mid-video dead spans
                 log.info(
                     f"--- Stage 1 (Probe) completed in {time.time() - stage1_start:.2f}s --- "
                     f"content {prop.content_start:.2f}s -> {prop.content_end:.2f}s | "
@@ -622,14 +741,28 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             seg_prop = (prop if prop.status == "OK" and prop.kept > 0
                         else replace(prop, content_start=0.0, content_end=prop.duration))
 
-            if _should_run_content_segmentation() and seg_prop.kept > 0:
+            if _should_run_content_segmentation() and seg_prop.kept > 0 and not video_has_audio:
+                # Silent video: skip fusion (needs a transcript) and segment by
+                # content type visually — labels scenes "Football game", etc.
+                log.info("Running visual content-type segmentation (no audio)...")
+                try:
+                    content_segments = run_visual_segmentation(local_video_path, seg_prop)
+                    taxonomy, transcript_turns = None, None
+                    log.info(f"Visual segmentation: {len(content_segments)} scenes "
+                             f"in {time.time() - stage2_start:.2f}s")
+                except Exception as e2:
+                    log.warning(f"Visual segmentation failed (falling back to dead-space only): {e2}")
+                    log.warning(traceback.format_exc())
+                    content_segments, taxonomy, transcript_turns = None, None, None
+            elif _should_run_content_segmentation() and seg_prop.kept > 0:
                 if prop.status != "OK":
                     log.info(f"Trim status={prop.status}; segmenting whole file "
                              f"0->{prop.duration:.1f}s (no auto dead-space markers)")
                 log.info("Running audio-visual fusion segmentation...")
                 try:
                     content_segments, taxonomy, transcript_turns = run_fusion_segmentation(
-                        local_video_path, s3_bucket, s3_key, seg_prop)
+                        local_video_path, s3_bucket, s3_key, seg_prop,
+                        turns=prefetched_turns)
                     log.info(f"Fusion segmentation complete: {len(content_segments)} segments "
                              f"in {time.time() - stage2_start:.2f}s")
                     for s in content_segments:
@@ -681,7 +814,7 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             # (not `prop`) so the head/tail dead-space markers match the window the
             # segments were actually computed over.
             seg_json = build_segment_json(s3_key, seg_prop, content_segments, taxonomy,
-                                          transcript_turns)
+                                          transcript_turns, mid_dead_spans=mid_dead_spans)
             log.info(f"Uploading segment JSON to s3://{s3_bucket}/{seg_s3_key}")
             s3_client.put_object(
                 Bucket=s3_bucket,

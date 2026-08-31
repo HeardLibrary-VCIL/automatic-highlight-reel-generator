@@ -55,6 +55,7 @@ class Run:
     whites: list = field(default_factory=list)  # (start, end) of white sub-regions
     bars: list = field(default_factory=list)    # (start, end) of color-bar sub-regions
     snows: list = field(default_factory=list)   # (start, end) of video-static/snow sub-regions
+    silences: list = field(default_factory=list)  # (start, end) of silence sub-regions
 
 
 @dataclass
@@ -188,6 +189,8 @@ def merge_runs(regions, gap):
             run.bars.append((r.start, r.end))
         elif r.kind == "snow":
             run.snows.append((r.start, r.end))
+        elif r.kind == "silence":
+            run.silences.append((r.start, r.end))
 
     runs = [Run(ordered[0].start, ordered[0].end)]
     record(runs[0], ordered[0])
@@ -283,7 +286,8 @@ def parse_log(path):
 
 def probe_video(input_video, *, min_dur=0.5, black_pic_th=0.995, black_min_dur=3.0,
                 freeze_db=-30.0,
-                silence_db=-30.0, bars_window=150.0, snow_window=150.0,
+                silence_db=-30.0, bars_window=60.0, snow_window=150.0,
+                bars_full_scan=False,
                 no_black=False, no_white=False, no_freeze=False, no_silence=False,
                 no_bars=False, no_snow=False):
     """Run the enabled detectors over a video. Returns (duration, [Region])."""
@@ -299,7 +303,14 @@ def probe_video(input_video, *, min_dur=0.5, black_pic_th=0.995, black_min_dur=3
         regions += detect_silence(input_video, min_dur, silence_db, duration)
     if not no_bars:
         import detect_bars
-        for s, e in detect_bars.bars_intervals(input_video, window=min(bars_window, duration)):
+        # Full-video analysis scans the whole file for bars (they appear between
+        # segments on VHS, not just at the head). Head/tail analysis only scans
+        # the opening window for efficiency. Bars leaders last several seconds, so
+        # a coarse step (every 3s) on the full scan keeps runtime bounded on large
+        # files — per-frame seeking in big H.264 is expensive.
+        bw = duration if bars_full_scan else min(bars_window, duration)
+        bstep = 3.0 if bars_full_scan else 1.0
+        for s, e in detect_bars.bars_intervals(input_video, window=bw, step=bstep):
             regions.append(Region(s, e, "bars"))
     if not no_snow:
         import detect_static
@@ -387,14 +398,29 @@ class FullVideoAnalysis:
     regions: list          # raw detector regions (for logging)
 
 
+def _overlaps_speech(start, end, speech_windows, min_overlap=2.0):
+    """True if [start,end] overlaps any speech window by at least min_overlap seconds.
+    Used to veto false dead spans: transcribed speech means the region is content,
+    regardless of how dark the frames are or how low the audio level reads."""
+    for ws, we in speech_windows:
+        overlap = min(end, we) - max(start, ws)
+        if overlap >= min_overlap:
+            return True
+    return False
+
+
 def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
-                        mode="black") -> list:
+                        mode="black", speech_windows=None) -> list:
     """Find ALL dead spans throughout the video, not just head/tail.
 
     Uses the same black-anchored philosophy as the head/tail detector: a dead
     span must contain at least one black, bars, or snow region to qualify. Pure
     freeze or silence alone is not enough (could be a static shot or quiet moment
     in real program).
+
+    Additionally, a dead span must have visual anchors (black/white/bars/snow)
+    covering at least 50% of its duration — a brief black at the start of a long
+    silence does not make the entire silence "dead".
 
     Args:
         regions:     raw detector Regions from probe_video()
@@ -411,6 +437,53 @@ def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
 
     # Merge ALL signals into runs (bridging small gaps)
     runs = merge_runs(regions, merge_gap)
+    speech_windows = speech_windows or []
+
+    # Merge adjacent same-kind visual sub-regions (bridging small gaps) so a
+    # filler split into chunks by brief non-black flashes is evaluated as one
+    # block, not several short ones.
+    def _coalesce(regs, gap=5.0):
+        if not regs:
+            return []
+        rs = sorted(regs)
+        out = [list(rs[0])]
+        for s, e in rs[1:]:
+            if s - out[-1][1] <= gap:
+                out[-1][1] = max(out[-1][1], e)
+            else:
+                out.append([s, e])
+        return [(s, e) for s, e in out]
+
+    # A sustained silent block overrides a coarse speech window: it's a real
+    # filler/leader between segments, not a shot-transition cut. Brief black cuts
+    # during a talking interview stay vetoed (they're normal editing).
+    SUSTAINED_DEAD_SEC = 20.0
+
+    def _is_sustained_silent(s, e, silences, min_frac=0.7):
+        if (e - s) < SUSTAINED_DEAD_SEC:
+            return False
+        cov = sum(min(e, se) - max(s, ss) for ss, se in silences
+                  if min(e, se) - max(s, ss) > 0)
+        return cov / (e - s) >= min_frac
+
+    def emit_visual_only(run):
+        """Report the bars/snow/black/white sub-regions that are truly dead.
+        Bars/snow are dead regardless of audio. black/white are dead where there's
+        no speech — OR where the region is a sustained silent block (overrides a
+        coarse speech window, so a silent filler/leader between segments is kept)."""
+        out = []
+        for regs, k, speech_immune in ((run.bars, "bars", True), (run.snows, "snow", True),
+                                       (_coalesce(run.blacks), "black", False),
+                                       (_coalesce(run.whites), "white", False)):
+            for s, e in regs:
+                if e - s < min_dead_dur:
+                    continue
+                if (not speech_immune
+                        and _overlaps_speech(s, e, speech_windows)
+                        and not _is_sustained_silent(s, e, run.silences)):
+                    continue
+                out.append(DeadSpan(start=s, end=e, kind=k))
+        return out
 
     dead_spans = []
     for run in runs:
@@ -423,6 +496,37 @@ def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
             has_anchor = bool(run.blacks or run.whites or run.bars or run.snows)
             if not has_anchor:
                 continue
+
+            # Visual anchors must cover at least 50% of the run duration to
+            # prevent a brief black blip from making a long silence "dead".
+            visual_dur = (sum(e - s for s, e in run.blacks)
+                          + sum(e - s for s, e in run.whites)
+                          + sum(e - s for s, e in run.bars)
+                          + sum(e - s for s, e in run.snows))
+            if run_dur > 30 and visual_dur / run_dur < 0.5:
+                # The full run is too long relative to its visual anchors.
+                # Report each contiguous visual sub-region separately (speech-vetoed).
+                dead_spans.extend(emit_visual_only(run))
+                continue
+
+            # Speech veto: if the run overlaps transcribed speech, it's content
+            # (dark/quiet program with talking). Report only the bars/snow portions
+            # (dead regardless of audio) plus any black/white NOT over speech.
+            if run.blacks and _overlaps_speech(run.start, run.end, speech_windows):
+                dead_spans.extend(emit_visual_only(run))
+                continue
+
+            # For long spans (>60s), require silence corroboration. Dark program
+            # with people talking is NOT dead space, even if a short bars/snow
+            # segment happens to fall within the same merged run. If silence
+            # doesn't cover most of the span, split out only the bars/snow
+            # portions (which ARE dead regardless of audio) and drop the rest.
+            if run_dur > 60:
+                silence_dur = sum(e - s for s, e in run.silences)
+                if silence_dur / run_dur < 0.5:
+                    dead_spans.extend(emit_visual_only(run))
+                    continue
+
             # Determine the kind based on what's dominant in this span
             if run.bars:
                 kind = "bars"
@@ -441,11 +545,30 @@ def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
 
         dead_spans.append(DeadSpan(start=run.start, end=run.end, kind=kind))
 
-    return sorted(dead_spans, key=lambda d: d.start)
+    dead_spans.sort(key=lambda d: d.start)
+
+    # Coalesce adjacent dead spans separated by a small gap so a black leader
+    # split into sub-runs (e.g. 0->55.5 and 57.6->61.9 by a brief non-black
+    # flash) is reported as one span. Uses a slightly larger gap than merge_gap
+    # since tape leaders often have brief non-black glitches. Kind is taken from
+    # the longest contributing span.
+    coalesce_gap = max(merge_gap, 5.0)
+    coalesced = []
+    for d in dead_spans:
+        if coalesced and d.start - coalesced[-1].end <= coalesce_gap:
+            prev = coalesced[-1]
+            if (d.end - d.start) > (prev.end - prev.start):
+                prev.kind = d.kind
+            prev.end = max(prev.end, d.end)
+        else:
+            coalesced.append(d)
+
+    return coalesced
 
 
 def analyze_full_video(input_video=None, *, from_log=None, mode="black",
                        merge_gap=2.0, min_dead_dur=3.0, min_content_dur=5.0,
+                       speech_windows=None,
                        **probe_kwargs) -> FullVideoAnalysis:
     """Probe the ENTIRE video for dead space and return all dead + content spans.
 
@@ -470,10 +593,14 @@ def analyze_full_video(input_video=None, *, from_log=None, mode="black",
     else:
         if not input_video:
             raise ValueError("analyze_full_video() needs input_video or from_log")
+        # Full-video analysis scans the whole file for bars (they appear between
+        # segments, not just at the head).
+        probe_kwargs.setdefault("bars_full_scan", True)
         duration, regions = probe_video(input_video, **probe_kwargs)
 
     dead_spans = find_all_dead_spans(regions, duration, merge_gap=merge_gap,
-                                     min_dead_dur=min_dead_dur, mode=mode)
+                                     min_dead_dur=min_dead_dur, mode=mode,
+                                     speech_windows=speech_windows)
 
     # Build content spans from the gaps between dead spans
     content_spans = []

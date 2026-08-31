@@ -25,9 +25,9 @@ import cv2
 import numpy as np
 
 # --- tunables (set against real frames below) ---
-SAT_MIN = 0.45          # mean saturation floor
-VERT_UNIFORM_MIN = 0.55  # column-constancy floor
-BANDS_MIN, BANDS_MAX = 4, 14
+SAT_MIN = 0.55          # mean saturation floor (bars are very vivid)
+VERT_UNIFORM_MIN = 0.70  # column-constancy floor (bars are very uniform top-to-bottom)
+BANDS_MIN, BANDS_MAX = 5, 12
 EDGE_THR = 42.0         # per-column color-change magnitude that marks a band edge
 
 
@@ -61,31 +61,62 @@ def bars_score(bgr) -> dict:
 
 def scan_video(path, window=90.0, step=1.0):
     """Sample frames every `step` s over the first `window` s (0 = whole file),
-    score each, and return (bars_timestamps, all_results)."""
-    cap = cv2.VideoCapture(path)
-    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    total = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
-    dur = total / fps if total else 0
+    score each, and return (bars_timestamps, all_results).
+
+    Uses ffmpeg to extract sampled frames in a SINGLE streaming pass (fps filter),
+    instead of per-sample cv2 seeking. Random seeking (cap.set POS_MSEC) is very
+    slow on large H.264 files — a full-file scan of a 1GB video that way can take
+    many minutes. Streaming decode at a low sample rate is bounded and fast."""
+    import subprocess
+    # Determine duration/end window via ffprobe (no full decode)
+    try:
+        out = subprocess.check_output(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=nokey=1:noprint_wrappers=1", path],
+            stderr=subprocess.DEVNULL).decode().strip()
+        dur = float(out) if out and out != "N/A" else 0.0
+    except Exception:
+        dur = 0.0
     end = dur if window == 0 else min(window, dur or window)
+
+    # Extract one frame every `step` seconds (fps=1/step), scaled small, as raw
+    # RGB24 over a pipe. Trim to the window with -t.
+    w, h = 160, 90
+    cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+           "-i", path]
+    if end > 0:
+        cmd += ["-t", f"{end:.3f}"]
+    cmd += ["-vf", f"fps=1/{step},scale={w}:{h}", "-pix_fmt", "bgr24",
+            "-f", "rawvideo", "pipe:1"]
+    frame_bytes = w * h * 3
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+
     bars_ts, results = [], []
-    t = 0.0
-    while t <= end:
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000.0)
-        ok, frame = cap.read()
-        if not ok:
+    idx = 0
+    while True:
+        buf = proc.stdout.read(frame_bytes)
+        if len(buf) < frame_bytes:
             break
+        frame = np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+        t = round(idx * step, 1)
+        # frame is already 160x90; bars_score resizes/crops internally but is safe
         sc = bars_score(frame)
-        results.append((round(t, 1), sc))
+        results.append((t, sc))
         if sc["is_bars"]:
-            bars_ts.append(round(t, 1))
-        t += step
-    cap.release()
+            bars_ts.append(t)
+        idx += 1
+    proc.stdout.close()
+    proc.wait()
     return bars_ts, results
 
 
 def bars_intervals(path, window=150.0, step=1.0, min_len=2.0):
     """Color-bar time intervals in the first `window` seconds, as [(start,end)].
-    Drops single-sample blips shorter than `min_len` s (e.g. a lone bar-like frame)."""
+    Drops single-sample blips shorter than `min_len` s (e.g. a lone bar-like frame).
+
+    Each detected sample represents a `step`-second window, so an interval's end
+    is extended by one step; this also lets coarse-step scans (step >= min_len)
+    still report a run from as few as one positive sample."""
     bars_ts, _ = scan_video(path, window=window, step=step)
     intervals = []
     for t in bars_ts:
@@ -93,7 +124,13 @@ def bars_intervals(path, window=150.0, step=1.0, min_len=2.0):
             intervals[-1][1] = t
         else:
             intervals.append([t, t])
-    return [(a, b) for a, b in intervals if b - a >= min_len]
+    # Extend each interval end by one step (the sample covers up to the next probe)
+    out = []
+    for a, b in intervals:
+        b_ext = b + step
+        if b_ext - a >= min_len:
+            out.append((a, b_ext))
+    return out
 
 
 def main():
