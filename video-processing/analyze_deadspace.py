@@ -501,17 +501,25 @@ def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
                   if min(e, se) - max(s, ss) > 0)
         return cov / (e - s) >= min_frac
 
+    # Bars/snow are UNAMBIGUOUS dead signals — a real program never contains SMPTE
+    # color bars or video static — so even a brief (1-2s) burst between segments is
+    # dead and must not be filtered out by the black-oriented min_dead_dur. Black/
+    # white keep the normal floor (a 1s black is just an edit cut).
+    VISUAL_MIN_DEAD = min(1.5, min_dead_dur)
+
     def emit_visual_only(run):
         """Report the bars/snow/black/white sub-regions that are truly dead.
-        Bars/snow are dead regardless of audio. black/white are dead where there's
-        no speech — OR where the region is a sustained silent block (overrides a
-        coarse speech window, so a silent filler/leader between segments is kept)."""
+        Bars/snow are dead regardless of audio AND use a lower duration floor.
+        black/white are dead where there's no speech — OR where the region is a
+        sustained silent block (overrides a coarse speech window)."""
         out = []
-        for regs, k, speech_immune in ((run.bars, "bars", True), (run.snows, "snow", True),
+        for regs, k, speech_immune in ((_coalesce(run.bars), "bars", True),
+                                       (_coalesce(run.snows), "snow", True),
                                        (_coalesce(run.blacks), "black", False),
                                        (_coalesce(run.whites), "white", False)):
+            floor = VISUAL_MIN_DEAD if speech_immune else min_dead_dur
             for s, e in regs:
-                if e - s < min_dead_dur:
+                if e - s < floor:
                     continue
                 if (not speech_immune
                         and _overlaps_speech(s, e, speech_windows)
@@ -523,7 +531,11 @@ def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
     dead_spans = []
     for run in runs:
         run_dur = run.end - run.start
-        if run_dur < min_dead_dur:
+        # A run that is purely bars/snow (no black/white/silence padding) uses the
+        # lower visual floor — a brief bars/snow burst between segments is still dead.
+        run_min = (VISUAL_MIN_DEAD if (run.bars or run.snows) and not (run.blacks or run.whites)
+                   else min_dead_dur)
+        if run_dur < run_min:
             continue
 
         if mode == "black":
@@ -581,6 +593,17 @@ def find_all_dead_spans(regions, duration, *, merge_gap=2.0, min_dead_dur=3.0,
         dead_spans.append(DeadSpan(start=run.start, end=run.end, kind=kind))
 
     dead_spans.sort(key=lambda d: d.start)
+
+    # Bars/snow are sampled discretely (every ~1.5-2s), so the detected interval can
+    # END a sample or two before the pattern actually stops -- leaving 1-2s of bars/
+    # snow leaking into the adjacent content. Pad the trailing (and leading) edge of
+    # each bars/snow span by one sample; they're guaranteed-dead patterns, so a small
+    # over-cover never eats real program. Clamp to [0, duration].
+    VISUAL_EDGE_PAD = 2.0
+    for d in dead_spans:
+        if d.kind in ("bars", "snow"):
+            d.start = max(0.0, d.start - VISUAL_EDGE_PAD)
+            d.end = min(duration, d.end + VISUAL_EDGE_PAD)
 
     # Coalesce adjacent dead spans separated by a small gap so a black leader
     # split into sub-runs (e.g. 0->55.5 and 57.6->61.9 by a brief non-black
