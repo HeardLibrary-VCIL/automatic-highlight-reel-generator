@@ -78,10 +78,91 @@ MAX_FRAME_WIDTH = int(os.environ.get("MAX_FRAME_WIDTH", "768"))
 FULL_VIDEO_SCAN = os.environ.get("FULL_VIDEO_SCAN", "on").lower() in ("on", "true", "1")
 
 
+# Normalized content categories used as `segment_type` in the output. Claude's
+# per-program taxonomy is open-vocabulary, so its free-text labels are folded into
+# this stable, finite set; the frontend color-codes segments by these values. Dead
+# space keeps its own "D" code (handled separately, not classified by Claude).
+CONTENT_CATEGORIES = (
+    "interview", "host", "report", "announcement", "performance",
+    "sports", "introduction", "closing", "credits", "other",
+)
+
+# Substring keywords → normalized category. Checked in order; first hit wins.
+_CATEGORY_KEYWORDS = (
+    ("interview", "interview"), ("q&a", "interview"), ("q and a", "interview"),
+    ("sport", "sports"), ("game", "sports"), ("match", "sports"),
+    ("credit", "credits"),
+    ("intro", "introduction"), ("teaser", "introduction"), ("open", "introduction"),
+    ("closing", "closing"), ("outro", "closing"), ("sign-off", "closing"),
+    ("sign off", "closing"), ("wrap-up", "closing"), ("wrap up", "closing"),
+    ("announce", "announcement"), ("psa", "announcement"),
+    ("public service", "announcement"), ("commercial", "announcement"),
+    ("advert", "announcement"), ("advocacy", "announcement"), ("ad ", "announcement"),
+    ("perform", "performance"), ("music", "performance"), ("dance", "performance"),('performer', 'performance'),
+    ("song", "performance"),
+    ("report", "report"), ("field", "report"), ("package", "report"), ("story", "report"),
+    ("host", "host"), ("anchor", "host"), ("monologue", "host"),
+    ("narrat", "host"), ("desk", "host"), ("link", "host"),
+)
+
+
+def normalize_category(label: str) -> str:
+    """Fold a free-text content label (from Claude's per-program taxonomy) into one
+    of CONTENT_CATEGORIES. Unmatched or empty labels become 'other'."""
+    r = (label or "").strip().lower()
+    if not r:
+        return "other"
+    if r in CONTENT_CATEGORIES:
+        return r
+    for kw, cat in _CATEGORY_KEYWORDS:
+        if kw in r:
+            return cat
+    return "other"
+
+
 def segment_key(s3_key: str) -> str:
     """Map an input key to its segment JSON key under segment/."""
     stem = Path(s3_key).name.rsplit(".", 1)[0]
     return f"{SEGMENT_PREFIX}/{stem}.json"
+
+
+_ORIG_NAME_CACHE: dict = {}
+
+
+def resolve_original_filename(s3_client, bucket: str, key: str) -> str:
+    """Best-effort ORIGINAL (user-facing) filename for this video, used both for
+    logging AND as `original-filename` object metadata stamped on every derivative,
+    so each S3 object (despite its UUID key) traces back to the archival item.
+
+    Objects are stored under a UUID key (video/<uuid>.mp4), so the key filename is
+    not the name the user uploaded. We recover the real name from S3 object
+    metadata when present -- a `Content-Disposition: ...filename="..."` or a user
+    metadata field ('original-filename' / 'originalfilename' / 'filename') -- and
+    fall back to the key's own filename otherwise. Cached per (bucket,key) so the
+    head_object runs once per run. Never raises; logging must not break processing."""
+    cache_key = (bucket, key)
+    if cache_key in _ORIG_NAME_CACHE:
+        return _ORIG_NAME_CACHE[cache_key]
+    resolved = _resolve_original_filename_uncached(s3_client, bucket, key)
+    _ORIG_NAME_CACHE[cache_key] = resolved
+    return resolved
+
+
+def _resolve_original_filename_uncached(s3_client, bucket: str, key: str) -> str:
+    try:
+        head = s3_client.head_object(Bucket=bucket, Key=key)
+        cd = head.get("ContentDisposition") or ""
+        m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', cd)
+        if m:
+            return Path(m.group(1)).name
+        meta = {k.lower(): v for k, v in (head.get("Metadata") or {}).items()}
+        for mk in ("original-filename", "originalfilename", "filename", "display-name"):
+            if meta.get(mk):
+                return Path(meta[mk]).name
+    except Exception as e:
+        log.warning("Could not read S3 metadata for original filename (%s: %s); "
+                    "using key filename", type(e).__name__, e)
+    return Path(key).name
 
 
 def safe_output_name(name: str, fallback_stem: str) -> str:
@@ -182,15 +263,16 @@ def get_transcript_turns(local_video_path, s3_bucket, s3_key):
     turns = to_speaker_turns(fetch_result(job, s3_client))
     if not turns:
         return []
-    # Cache transcript + VTT
+    # Cache transcript + VTT (stamped with the source original filename for traceability)
     try:
+        orig_meta = {"original-filename": resolve_original_filename(s3_client, s3_bucket, s3_key)}
         s3_client.put_object(Bucket=s3_bucket, Key=transcript_cache_key,
                              Body=json.dumps(turns, indent=2).encode("utf-8"),
-                             ContentType="application/json")
+                             ContentType="application/json", Metadata=orig_meta)
         s3_client.put_object(Bucket=s3_bucket,
                              Key=transcript_cache_key.replace(".json", ".vtt"),
                              Body=turns_to_vtt(turns).encode("utf-8"),
-                             ContentType="text/vtt")
+                             ContentType="text/vtt", Metadata=orig_meta)
         log.info(f"[A] Cached transcript + VTT")
     except Exception as cache_err:
         log.warning(f"[A] Could not cache transcript: {cache_err}")
@@ -216,6 +298,37 @@ def speech_windows_from_turns(turns, merge_gap=5.0):
         else:
             merged.append([s, e])
     return [(s, e) for s, e in merged]
+
+
+# The visual detectors (bars/snow/black/white) are audio-INDEPENDENT, so they mark
+# a leader dead even when it plays LOUD noise/tone. Color-bars/countdown/tape leaders
+# are exactly that: a vivid but non-program picture over a loud 1kHz tone or hiss.
+# These constants gate the head-leader guard below.
+HEAD_LEADER_MAX = float(os.environ.get("HEAD_LEADER_MAX", "180.0"))  # only reclassify a leader within the first N s
+HEAD_LEADER_MIN = float(os.environ.get("HEAD_LEADER_MIN", "2.0"))    # ignore trivially short head regions
+
+
+def head_leader_end(regions, *, max_head=HEAD_LEADER_MAX, gap=3.0):
+    """End time of a leading NON-PROGRAM leader (color bars / snow / black / white)
+    that begins at (or very near) t=0, or 0.0 if there is none.
+
+    Uses ONLY the visual detector regions, so a leader with LOUD audio (a tone or
+    noise over color bars) is still recognized as dead -- audio level and any
+    speech Transcribe may have hallucinated over the noise are irrelevant here.
+    Contiguous leader regions separated by <= `gap` are chained so a bars->black
+    ->snow leader counts as one block."""
+    lead = [(r.start, r.end) for r in regions
+            if r.kind in ("bars", "snow", "black", "white")]
+    lead.sort()
+    end = 0.0
+    for s, e in lead:
+        if s <= max(HEAD_LEADER_MIN, end) + gap:   # starts at 0 or chains onto the run
+            end = max(end, e)
+        elif s > end:
+            break                                   # a real content gap -> leader is over
+        if end >= max_head:
+            break
+    return end if end >= HEAD_LEADER_MIN else 0.0
 
 
 def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=None):
@@ -397,14 +510,16 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
         for seg in content_segments:
             label = seg.get("label", "other")
             name = (seg.get("name") or "").strip()
-            # Editor segment_type codes: "C" = a recognized content type,
-            # "I" = generic/unclassified content.
-            seg_type = "I" if label == "other" else "C"
+            # segment_type is the NORMALIZED content category (see CONTENT_CATEGORIES),
+            # folded from Claude's per-program label. The frontend color-codes by it.
+            # (Dead-space segments keep the separate "D" code.)
+            category = normalize_category(label)
             segments.append({
                 "segment_start": round(seg["start"], 2),
                 "segment_end": round(seg["end"], 2),
-                "segment_type": seg_type,
+                "segment_type": category,
                 "title": name or label.title(),
+                "description": (seg.get("description") or "").strip(),
                 "content_label": label,
                 "speakers": seg.get("speakers", []),
                 "transcript": _transcript(seg["start"], seg["end"]),
@@ -516,7 +631,9 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
 def write_review_marker(s3_client, bucket: str, s3_key: str, prop) -> None:
     """Drop a review marker so a human can find flagged files."""
     stem = Path(s3_key).name.rsplit(".", 1)[0]
+    original_filename = resolve_original_filename(s3_client, bucket, s3_key)
     body = (
+        f"original_filename: {original_filename}\n"
         f"source: s3://{bucket}/{s3_key}\n"
         f"status: {prop.status}\n"
         f"proposed content: {prop.content_start:.2f}s -> {prop.content_end:.2f}s\n"
@@ -525,7 +642,8 @@ def write_review_marker(s3_client, bucket: str, s3_key: str, prop) -> None:
     )
     try:
         s3_client.put_object(Bucket=bucket, Key=f"review/{stem}.txt",
-                             Body=body.encode("utf-8"))
+                             Body=body.encode("utf-8"),
+                             Metadata={"original-filename": original_filename})
     except Exception as e:
         log.warning(f"Could not write review marker: {e}")
 
@@ -552,6 +670,8 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
     log.info("=== SCUA Video Trimmer Starting ===")
     trim_request_key = os.environ.get("TRIM_REQUEST_KEY", "")
     s3_client = boto3.client("s3")
+    original_filename = resolve_original_filename(s3_client, s3_bucket, s3_key)
+    log.info(f"Trimming original video '{original_filename}' (s3://{s3_bucket}/{s3_key})")
 
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
@@ -619,8 +739,12 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
             # back to the legacy sanitized-name path for older requests.
             output_key = trim_data.get("output_key") or \
                 f"edit/{safe_output_name(trim_data.get('output_name'), video_name)}"
-            log.info(f"Uploading trimmed video to s3://{s3_bucket}/{output_key}")
-            s3_client.upload_file(str(trimmed_path), s3_bucket, output_key)
+            log.info(f"Uploading trimmed video to s3://{s3_bucket}/{output_key} "
+                     f"(original-filename='{original_filename}')")
+            # Derivatives carry the SOURCE original's filename so every object traces
+            # back to the archival item, despite the UUID key.
+            s3_client.upload_file(str(trimmed_path), s3_bucket, output_key,
+                                  ExtraArgs={"Metadata": {"original-filename": original_filename}})
 
             log.info(f"=== SCUA Video Trimmer Finished Successfully in "
                      f"{time.time() - pipeline_start_time:.2f}s ===")
@@ -638,8 +762,10 @@ def run_trim(s3_bucket, s3_key, pipeline_start_time):
 def run_detect(s3_bucket, s3_key, pipeline_start_time):
     """Detect dead space and write segment JSON."""
     log.info("=== SCUA Segment Detector Starting ===")
-    log.info(f"Processing s3://{s3_bucket}/{s3_key}  (mode={TRIM_MODE})")
     s3_client = boto3.client("s3")
+    original_filename = resolve_original_filename(s3_client, s3_bucket, s3_key)
+    log.info(f"Processing original video '{original_filename}' "
+             f"(s3://{s3_bucket}/{s3_key}, mode={TRIM_MODE})")
 
     with tempfile.TemporaryDirectory() as temp_dir_str:
         temp_dir = Path(temp_dir_str)
@@ -697,6 +823,20 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 prop = Proposal(full_analysis.duration, cs_start, cs_end,
                                 full_analysis.status, full_analysis.notes,
                                 full_analysis.regions)
+                # Head-leader guard: a color-bars/snow/black leader that plays LOUD
+                # noise or tone can slip through (loud audio defeats silence, and
+                # Transcribe may hallucinate "speech" over the noise, vetoing the dead
+                # span) -- leaving content_start pinned at the leader. Reclassify the
+                # leading visual-dead run as dead space directly from the audio-blind
+                # visual detectors, and drop any (spurious) speech windows sitting
+                # inside it so they can't re-absorb it downstream.
+                lead_end = head_leader_end(full_analysis.regions)
+                if lead_end > cs_start + 0.5:
+                    log.info(f"  HEAD-LEADER guard: reclassifying 0->{lead_end:.1f}s "
+                             f"as dead (visual leader; audio ignored)")
+                    prop = replace(prop, content_start=lead_end)
+                    cs_start = lead_end
+                    speech_windows = [(s, e) for (s, e) in speech_windows if e > lead_end + 0.5]
                 # Mid-video dead spans (bars/black/snow between content) — these fall
                 # inside [cs_start, cs_end] so build_segment_json must inject them as
                 # "D" markers, else they're hidden inside the content window.
@@ -772,14 +912,15 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                     if transcript_turns:
                         transcript_s3_key = f"transcript/{stem}.json"
                         try:
+                            _orig_meta = {"original-filename": original_filename}
                             s3_client.put_object(
                                 Bucket=s3_bucket, Key=transcript_s3_key,
                                 Body=json.dumps(transcript_turns, indent=2).encode("utf-8"),
-                                ContentType="application/json")
+                                ContentType="application/json", Metadata=_orig_meta)
                             s3_client.put_object(
                                 Bucket=s3_bucket, Key=transcript_s3_key.replace(".json", ".vtt"),
                                 Body=turns_to_vtt(transcript_turns).encode("utf-8"),
-                                ContentType="text/vtt")
+                                ContentType="text/vtt", Metadata=_orig_meta)
                             log.info(f"  Cached transcript + VTT to s3://{s3_bucket}/{transcript_s3_key}")
                         except Exception as cache_err:
                             log.warning(f"  Could not cache transcript: {cache_err}")
@@ -821,6 +962,7 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 Key=seg_s3_key,
                 Body=json.dumps(seg_json, indent=2).encode("utf-8"),
                 ContentType="application/json",
+                Metadata={"original-filename": original_filename},
             )
 
             log.info(f"--- Stage 3 (Write Segments) completed in "

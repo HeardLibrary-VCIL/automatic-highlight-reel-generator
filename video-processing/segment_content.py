@@ -133,14 +133,14 @@ def sample_windows(path, interval=30.0, frames_per_window=3, max_width=768,
 # This is the whole point of the tool -- detect where these specific types occur,
 # not describe the video. Edit the list (or pass --categories) to change targets.
 CATEGORIES = ["dance performance", "football game", "tv show", "interview",
-              "political ad", "public service announcement"]
+              "political ad", "public service announcement", "music performance"]
 OTHER = "other"
 
 # Optional clarifications shown after a category in the prompt. Broadens the
 # fuzzy ones (dance covers concerts/parties) and separates the two ad-like types.
 CATEGORY_HINTS = {
     "dance performance": "any real dancing on screen -- a stage or dance "
-                         "performance, a concert, a party, or a crowd dancing",
+                         "performance, a party, or a crowd dancing",
     "political ad": "a campaign spot for a candidate, party, or ballot measure",
     "public service announcement": "a non-commercial awareness or advocacy "
                                    "message (health, safety, social causes), "

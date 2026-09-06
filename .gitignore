@@ -84,3 +84,5 @@ model-testing/test_frames.tar.gz
 
 # Copilot context
 /prompts/
+
+*.mp4

@@ -66,7 +66,12 @@ export class HighlightProcessorStack extends cdk.Stack {
     const capacityProvider = new ecs.AsgCapacityProvider(this, 'VideoProcessorCP', {
       autoScalingGroup,
       enableManagedScaling: true,
-      enableManagedTerminationProtection: false,
+      // Protect instances that have a running task from scale-in. Video
+      // processing is a long batch job (minutes); without this, the ASG can
+      // terminate the instance mid-run, killing the task before it finishes
+      // (segmentation silently never completes). ECS scales the instance down
+      // only after its task ends.
+      enableManagedTerminationProtection: true,
     });
 
     cluster.addAsgCapacityProvider(capacityProvider);
@@ -320,12 +325,21 @@ def handler(event, context):
             s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
 
         elif event['RequestType'] == 'Delete':
-            existing = s3.get_bucket_notification_configuration(Bucket=bucket)
-            existing.pop('ResponseMetadata', None)
-            lambda_configs = existing.get('LambdaFunctionConfigurations', [])
-            lambda_configs = [c for c in lambda_configs if c.get('Id') not in (notification_id, notification_id + '-trim', notification_id + '-segment')]
-            existing['LambdaFunctionConfigurations'] = lambda_configs
-            s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
+            # Best-effort cleanup: removing our notification entries is not worth
+            # failing (and rolling back) the whole stack. This DELETE also runs when
+            # the BucketName parameter CHANGES (CloudFormation replaces the resource
+            # and deletes the OLD one) — and the old bucket may be a DIFFERENT Amplify
+            # branch bucket the handler's role can't touch, or may be gone entirely.
+            # Swallow any error and still report SUCCESS so the deploy proceeds.
+            try:
+                existing = s3.get_bucket_notification_configuration(Bucket=bucket)
+                existing.pop('ResponseMetadata', None)
+                lambda_configs = existing.get('LambdaFunctionConfigurations', [])
+                lambda_configs = [c for c in lambda_configs if c.get('Id') not in (notification_id, notification_id + '-trim', notification_id + '-segment')]
+                existing['LambdaFunctionConfigurations'] = lambda_configs
+                s3.put_bucket_notification_configuration(Bucket=bucket, NotificationConfiguration=existing)
+            except Exception as del_err:
+                print(f"Delete cleanup skipped (non-fatal) for bucket {bucket}: {del_err}")
 
         cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, STABLE_ID)
     except Exception as e:
@@ -334,10 +348,19 @@ def handler(event, context):
 `),
     });
 
+    // The notification handler must manage the CURRENT bucket, but on a BucketName
+    // parameter change CloudFormation replaces this resource and runs a DELETE against
+    // the PREVIOUS bucket (often a sibling Amplify branch bucket). Grant the notif
+    // actions on any Amplify storage bucket in this account/region so that cross-branch
+    // cleanup DELETE can succeed instead of AccessDenied. (Scoped to Amplify buckets,
+    // not all of S3.)
     notificationHandler.addToRolePolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
       actions: ['s3:GetBucketNotification', 's3:PutBucketNotification'],
-      resources: [videoBucket.bucketArn],
+      resources: [
+        videoBucket.bucketArn,
+        'arn:aws:s3:::amplify-*-scuavideostoragebucket*',
+      ],
     }));
 
     new cdk.CustomResource(this, 'S3NotificationConfig', {

@@ -86,7 +86,15 @@ PROMPT_HEADER = (
     "where people are talking (types that look identical on screen -- an interview, a "
     "monologue, a scripted announcement -- are told apart by what is said), and let "
     "the FRAME decide segments with little or no speech (music/performance, an "
-    "animation, a title/name card, filler or leader footage), where audio is blind."
+    "animation, a title/name card, filler or leader footage), where audio is blind.\n"
+    "IMPORTANT -- performances: classify by what the segment MOSTLY is, not by a brief "
+    "lead-in. A musical or dance performance is often preceded by a few seconds of a "
+    "performer introducing themselves or the piece ('Hi, I'm ... and I'll be singing "
+    "...'). That short intro does NOT make the segment a host/monologue segment: if the "
+    "segment is dominated by singing, music, or dancing (the frame shows a stage/"
+    "performance and the words are sparse, lyric-like, or just a short spoken intro), "
+    "classify it as a PERFORMANCE. Only classify as host/anchor/monologue when the "
+    "segment is PREDOMINANTLY a person talking to camera with no performance."
 )
 
 ANALYZE_PROMPT = (
@@ -489,14 +497,20 @@ def build_task(taxonomy) -> str:
     lines = "\n".join(f"- {t['type']}: {t['definition']}" for t in taxonomy)
     return ("\n\nClassify EACH segment into exactly one content type:\n" + lines +
             "\n- other: none of the above\n"
-            "Then give a specific 3-6 word name.\n"
-            "Also transcribe any ON-SCREEN TEXT visible in the frame -- a name/title "
+            "Then, for each segment, provide:\n"
+            "- name: a specific 3-6 word title. When the segment HAS SPEECH, base the "
+            "name on WHAT IS SAID (the actual topic/subject of the words), NOT on the "
+            "video frame -- the frame is often an establishing shot, slate, or title "
+            "card that does not represent the spoken content. Only when there is little "
+            "or no speech should the frame or on-screen text drive the name.\n"
+            "- description: one sentence (<= 25 words) summarizing what happens in the "
+            "segment, from the words when spoken (else the frame).\n"
+            "- on_screen_text: any ON-SCREEN TEXT visible in the frame -- a name/title "
             "caption (lower-third/chyron), a title card, or credits -- EXACTLY as shown; "
-            'use "" if the frame has no readable overlaid text. This caption often gives '
-            "the real speaker name or segment title, so prefer it when naming.\n"
+            'use "" if the frame has no readable overlaid text.\n'
             "Reply with ONLY a JSON array, one object per segment IN ORDER:\n"
             '[{"i": 0, "label": "<one of the types>", "name": "<short name>", '
-            '"on_screen_text": "<caption or empty>"}, ...]')
+            '"description": "<one sentence>", "on_screen_text": "<caption or empty>"}, ...]')
 
 
 def _parse_label_array(text):
@@ -564,6 +578,7 @@ def _label_batch(batch, client, taxonomy, cap, model, max_width, host) -> list:
         o = by_i.get(i, {})
         out.append({**s, "label": canonical(o.get("label"), types),
                     "name": o.get("name", "").strip(),
+                    "description": str(o.get("description", "")).strip(),
                     "on_screen_text": str(o.get("on_screen_text", "")).strip()})
     return out
 
@@ -589,7 +604,7 @@ def label_segments(segments, client, taxonomy, video_path=None, model=BEDROCK_MO
                     out.extend(_label_batch(batch, client, taxonomy, cap, model, max_width, host))
                 except Exception:
                     out.extend({**s, "label": canonical(None, types), "name": "",
-                                "on_screen_text": ""} for s in batch)
+                                "description": "", "on_screen_text": ""} for s in batch)
     finally:
         if cap is not None:
             cap.release()
@@ -685,8 +700,13 @@ def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
             lbl = c.get("label", "other")
             secs[lbl] = secs.get(lbl, 0.0) + (c["end"] - c["start"])
         g["label"] = max(secs, key=secs.get)
-        g["name"] = max((c for c in g["_children"] if c.get("label", "other") == g["label"]),
-                        key=lambda c: c["end"] - c["start"]).get("name", "")
+        # Name + description come from the LONGEST child of the dominant label -- the
+        # piece most representative of the merged story -- so a short slate/title-card
+        # child never renames a long interview.
+        rep = max((c for c in g["_children"] if c.get("label", "other") == g["label"]),
+                  key=lambda c: c["end"] - c["start"])
+        g["name"] = rep.get("name", "")
+        g["description"] = rep.get("description", "")
         g["on_screen_text"] = next((c.get("on_screen_text", "") for c in g["_children"]
                                     if c.get("on_screen_text", "").strip()), "")
 
@@ -704,8 +724,8 @@ def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
         else:
             out.append(g)
     return [{"start": g["start"], "end": g["end"], "label": g["label"],
-             "name": g["name"], "speakers": g["speakers"],
-             "on_screen_text": g["on_screen_text"]} for g in out]
+             "name": g["name"], "description": g.get("description", ""),
+             "speakers": g["speakers"], "on_screen_text": g["on_screen_text"]} for g in out]
 
 
 def main():

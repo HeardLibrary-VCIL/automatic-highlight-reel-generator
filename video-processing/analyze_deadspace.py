@@ -34,10 +34,13 @@ Usage:
 """
 
 import argparse
+import logging
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -302,23 +305,55 @@ def probe_video(input_video, *, min_dur=0.5, black_pic_th=0.995, black_min_dur=3
     if not no_silence:
         regions += detect_silence(input_video, min_dur, silence_db, duration)
     if not no_bars:
-        import detect_bars
-        # Full-video analysis scans the whole file for bars (they appear between
-        # segments on VHS, not just at the head). Head/tail analysis only scans
-        # the opening window for efficiency. Bars leaders last several seconds, so
-        # a coarse step (every 3s) on the full scan keeps runtime bounded on large
-        # files — per-frame seeking in big H.264 is expensive.
-        bw = duration if bars_full_scan else min(bars_window, duration)
-        bstep = 3.0 if bars_full_scan else 1.0
-        for s, e in detect_bars.bars_intervals(input_video, window=bw, step=bstep):
-            regions.append(Region(s, e, "bars"))
+        # Bars/snow are cv2-based; isolate so an import or scan error can't wipe out
+        # BOTH visual detectors (or abort the whole probe) and silently miss a leader.
+        # The import and the scan are caught SEPARATELY so logs distinguish "cv2 is
+        # missing/broken" (a deploy problem) from "the scan errored on this file".
+        try:
+            import detect_bars
+        except Exception as e:
+            log.error("BARS DETECTOR UNAVAILABLE — cv2/detect_bars import failed (%s: %s); "
+                      "color-bars leaders will NOT be detected. Check opencv-python-headless "
+                      "is installed in the container.", type(e).__name__, e)
+            detect_bars = None
+        if detect_bars is not None:
+            # Full-video analysis scans the whole file for bars (they appear between
+            # segments on VHS, not just at the head). A short bars leader (a few
+            # seconds) needs a fine step, or a coarse 3s step samples it too few times
+            # and drops it. Use a 1.5s step on the full scan and a 2s min_len.
+            bw = duration if bars_full_scan else min(bars_window, duration)
+            bstep = 1.5 if bars_full_scan else 1.0
+            try:
+                found = detect_bars.bars_intervals(input_video, window=bw, step=bstep, min_len=2.0)
+                for s, e in found:
+                    regions.append(Region(s, e, "bars"))
+                log.info("bars scan: window=%.0fs step=%.1fs -> %d interval(s): %s",
+                         bw, bstep, len(found), [(round(s, 1), round(e, 1)) for s, e in found])
+            except Exception as e:
+                log.error("bars scan FAILED on %s (%s: %s); leaders may be missed",
+                          input_video, type(e).__name__, e)
     if not no_snow:
-        import detect_static
-        # For full-video analysis, scan the entire file for snow/static (not just edges).
-        # Use step=2.0 for efficiency on long videos.
-        snow_windows = [(0.0, duration)]
-        for s, e in detect_static.snow_intervals(input_video, snow_windows, step=2.0):
-            regions.append(Region(s, e, "snow"))
+        try:
+            import detect_static
+        except Exception as e:
+            log.error("SNOW DETECTOR UNAVAILABLE — cv2/detect_static import failed (%s: %s); "
+                      "snow/static will NOT be detected. Check opencv-python-headless "
+                      "is installed in the container.", type(e).__name__, e)
+            detect_static = None
+        if detect_static is not None:
+            # Scan the entire file for snow/static. A short 4-5s snow burst needs a
+            # fine step, or a 2s step can produce too few positive samples and be
+            # dropped. Use a 1s step and a 2s min_len so a brief burst is caught.
+            snow_windows = [(0.0, duration)]
+            try:
+                found = detect_static.snow_intervals(input_video, snow_windows, step=1.0, min_len=2.0)
+                for s, e in found:
+                    regions.append(Region(s, e, "snow"))
+                log.info("snow scan: step=1.0s -> %d interval(s): %s",
+                         len(found), [(round(s, 1), round(e, 1)) for s, e in found])
+            except Exception as e:
+                log.error("snow scan FAILED on %s (%s: %s); snow may be missed",
+                          input_video, type(e).__name__, e)
     return duration, regions
 
 
