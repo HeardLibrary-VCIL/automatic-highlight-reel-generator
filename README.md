@@ -72,7 +72,7 @@ Graceful fallback: if labeling fails, content spans are still output with their 
 
 ### Stage 4: Write Segment JSON
 
-Writes `segment/{name}.json` to S3 with alternating D (dead) and C/I (content) segments:
+Writes `segment/{name}.json` to S3 :
 
 ```json
 {

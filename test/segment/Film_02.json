@@ -1,0 +1,23 @@
+{
+  "video": "Film_02.mp4",
+  "segments": [
+    {
+      "segment_start": 0,
+      "segment_end": 1066.38,
+      "segment_type": "sports",
+      "title": "Football Game",
+      "description": "",
+      "transcript": "",
+      "caption": ""
+    },
+    {
+      "segment_start": 1066.38,
+      "segment_end": 1081.19,
+      "segment_type": "other",
+      "title": "vintage crowd gathering",
+      "description": "",
+      "transcript": "",
+      "caption": ""
+    }
+  ]
+}

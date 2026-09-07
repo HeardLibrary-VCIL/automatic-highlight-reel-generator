@@ -33,6 +33,7 @@ project AWS creds for Bedrock (classify step only; --no-classify needs neither):
 
 import argparse
 import json
+import os
 import sys
 
 import cv2
@@ -42,7 +43,7 @@ from analyze_deadspace import get_duration, analyze
 # Reuse the whole classify/merge machinery -- this module only swaps the sampler.
 from segment_content import (
     Segment, OTHER, CATEGORIES, CLASSIFY_MODEL,
-    _read_at, _encode_frame, classify_window,
+    _read_at, _encode_frame, classify_window, classify_shots_batch,
     confirm_targets, smooth_labels, _coalesce, consolidate_segments, other_note,
 )
 
@@ -103,43 +104,76 @@ def sample_shot(cap, start, end, frames_per_shot=3, max_width=768) -> list:
     return jpegs
 
 
+# How many shots to classify per Bedrock call, and the max frames (images) allowed in
+# one request. Batching multiple shots into one call is the big efficiency win: it cuts
+# the number of (rate-limited) calls ~SHOT_BATCH-fold, so a 60-shot tape goes from ~60
+# calls to ~10-15 instead of pacing one call every 6.5s. SHOT_BATCH caps shots/call;
+# BATCH_MAX_IMAGES caps total frames/call so a burst of long shots (3 frames each) can't
+# build an oversized request. Both env-tunable.
+SHOT_BATCH = int(os.environ.get("SHOT_BATCH", "5"))
+BATCH_MAX_IMAGES = int(os.environ.get("BATCH_MAX_IMAGES", "18"))
+
+
+def _batch_shots(sampled):
+    """Group (index, ss, ee, jpegs) tuples into batches bounded by SHOT_BATCH shots and
+    BATCH_MAX_IMAGES frames per batch (whichever hits first)."""
+    batches, cur, cur_imgs = [], [], 0
+    for item in sampled:
+        n_imgs = len(item[3])
+        if cur and (len(cur) >= SHOT_BATCH or cur_imgs + n_imgs > BATCH_MAX_IMAGES):
+            batches.append(cur)
+            cur, cur_imgs = [], 0
+        cur.append(item)
+        cur_imgs += n_imgs
+    if cur:
+        batches.append(cur)
+    return batches
+
+
 def label_shots(path, shots, model=CLASSIFY_MODEL, frames_per_shot=3,
                 max_width=768, categories=None) -> list:
     """Classify each shot into the closed set (or OTHER). Returns
-    [(shot_start, category, description)]. One VLM call per shot (Bedrock)."""
-    import os
+    [(shot_start, category, description)]. Shots are classified in BATCHES (several per
+    Bedrock call) to cut the number of rate-limited calls; classify_shots_batch keeps
+    the same closed-set contract as the old one-call-per-shot path."""
     import time
     from bedrock import make_client
     client = make_client()
-    # The applied cross-region RPM for this Sonnet inference profile is ~10/min
-    # (confirmed: a burst of 6 calls in ~6s all returned 429). Pace at one call
-    # every ~6.5s to stay just under it. classify_window ALSO retries with
-    # exponential backoff, so any call that still trips the limit (e.g. when
-    # another task shares the quota) is retried rather than aborting the run.
-    # Tunable via BEDROCK_CALL_DELAY (lower it if the quota is raised).
+    # The applied cross-region RPM for this inference profile is ~10/min (a burst of 6
+    # calls in ~6s all returned 429). We now issue ONE call per BATCH of shots, so the
+    # same pacing between CALLS covers many more shots. create_with_retry (inside
+    # classify_shots_batch) also backs off, so a call that still trips the limit is
+    # retried rather than aborting. Tunable via BEDROCK_CALL_DELAY.
     call_delay = float(os.environ.get("BEDROCK_CALL_DELAY", "6.5"))
     cap = cv2.VideoCapture(path)
-    labeled = []
+    # Sample every shot's frames first (cheap, local), dropping shots that don't decode.
+    sampled = []
     for i, (ss, ee) in enumerate(shots):
         jpegs = sample_shot(cap, ss, ee, frames_per_shot, max_width)
-        if not jpegs:
-            continue
-        if i > 0 and call_delay > 0:
+        if jpegs:
+            sampled.append((i, ss, ee, jpegs))
+    cap.release()
+
+    labeled = []
+    for b, batch in enumerate(_batch_shots(sampled)):
+        if b > 0 and call_delay > 0:
             time.sleep(call_delay)
+        shots_jpegs = [jpegs for (_, _, _, jpegs) in batch]
         try:
-            cat, desc = classify_window(client, jpegs, model, ee - ss, categories)
+            results = classify_shots_batch(client, shots_jpegs, model, categories)
         except Exception as e:
-            # A single shot that still fails after retries must NOT discard every
-            # other successfully-labeled shot. Skip it and continue; the segment
-            # gap is filled by its neighbors during coalescing. Only if NO shot
-            # labels does the caller fall back to dead-space-only.
-            print(f"  [{ss:8.2f} -> {ee:8.2f}] classify failed, skipping: {e}",
+            # A batch that still fails after retries must NOT discard every other
+            # successfully-labeled shot. Skip this batch's shots and continue; the gaps
+            # are filled by neighbors during coalescing. Only if NO shot labels does the
+            # caller fall back to dead-space-only.
+            span = f"{batch[0][1]:8.2f} -> {batch[-1][2]:8.2f}"
+            print(f"  [{span}] batch classify failed, skipping {len(batch)} shots: {e}",
                   file=sys.stderr)
             continue
-        labeled.append((ss, cat, desc))
-        shown = cat + (f" ({desc})" if cat == OTHER and desc else "")
-        print(f"  [{ss:8.2f} -> {ee:8.2f}] ({len(jpegs)}f) {shown}", file=sys.stderr)
-    cap.release()
+        for (_, ss, ee, jpegs), (cat, desc) in zip(batch, results):
+            labeled.append((ss, cat, desc))
+            shown = cat + (f" ({desc})" if cat == OTHER and desc else "")
+            print(f"  [{ss:8.2f} -> {ee:8.2f}] ({len(jpegs)}f) {shown}", file=sys.stderr)
     return labeled
 
 

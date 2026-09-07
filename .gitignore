@@ -86,3 +86,4 @@ model-testing/test_frames.tar.gz
 /prompts/
 
 *.mp4
+/test/video/*

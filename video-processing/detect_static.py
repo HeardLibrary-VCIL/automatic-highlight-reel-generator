@@ -23,10 +23,32 @@ import argparse
 import cv2
 import numpy as np
 
-# tunables (set against synthetic snow vs real program below)
-LAP_MIN = 400.0      # Laplacian variance floor (lowered for noisy VHS transitions)
-SMOOTH_MAX = 0.10    # max fraction of smooth (flat) blocks (raised for partial-signal fuzz)
-MAD_MIN = 20.0       # min mean-abs-diff to the next frame (lowered for low-contrast noise)
+import os
+
+# Tunables. Snow (tape run-out / dead signal) is an EXTREME signal: near-pure noise
+# with very high high-frequency energy, essentially no flat regions, and near-total
+# frame-to-frame decorrelation. The thresholds were previously loosened for "noisy VHS
+# transitions", which let busy/grainy REAL program read as snow (false positives). They
+# are tightened here so only genuine static qualifies. All three must hold to flag snow,
+# so raising any of them reduces false positives. Env-overridable for tuning without a
+# code change (SNOW_LAP_MIN / SNOW_SMOOTH_MAX / SNOW_MAD_MIN).
+# Priority: RECALL over precision — a real ~2s snow burst MUST be caught; a false
+# positive is acceptable (a human trims it). So the FRAME thresholds stay SENSITIVE
+# (catch faint/brief snow), and the single observed false positive (one lone busy
+# frame) is suppressed downstream by requiring a SUSTAINED run (min_len >= 2s in
+# snow_intervals): real snow trips several consecutive frames; a stray detailed frame
+# does not. Env-overridable for tuning without a code change.
+LAP_MIN = float(os.environ.get("SNOW_LAP_MIN", "500.0"))     # Laplacian variance floor
+SMOOTH_MAX = float(os.environ.get("SNOW_SMOOTH_MAX", "0.10"))  # max fraction of flat blocks
+MAD_MIN = float(os.environ.get("SNOW_MAD_MIN", "20.0"))      # min frame-to-frame mean-abs-diff
+# NCC (normalized cross-correlation between consecutive frames) is the DEFINITIVE snow
+# discriminator: snow is temporally DECORRELATED (each frame independent of the next),
+# so consecutive-frame NCC ~ 0. Real program — even a busy, noisy, MOVING title/intro —
+# stays temporally COHERENT (title, letterboxing, moving elements persist), so its NCC
+# is clearly positive. Measured: true snow NCC <= ~0.10; a false-positive captioned
+# intro (RCC_10 ~62-70s) NCC >= ~0.15. lap/smooth/mad alone can't separate those two
+# (both look high-frequency), but NCC does. Snow requires NCC below this ceiling.
+NCC_MAX = float(os.environ.get("SNOW_NCC_MAX", "0.12"))     # max consecutive-frame correlation
 BLOCK = 16
 SMOOTH_STD = 12.0    # a block with std below this is "smooth"
 
@@ -51,8 +73,21 @@ def snow_score(prev_gray, gray) -> dict:
     smooth = sm / max(1, n)
     mad = (float(np.mean(np.abs(gray.astype(np.int16) - prev_gray.astype(np.int16))))
            if prev_gray is not None else 0.0)
-    is_snow = lap > LAP_MIN and smooth < SMOOTH_MAX and mad > MAD_MIN
-    return {"lap": round(lap, 1), "smooth": round(smooth, 3), "mad": round(mad, 1), "is_snow": is_snow}
+    # Normalized cross-correlation to the previous frame: ~0 for snow (independent
+    # frames), clearly positive for coherent program. High ncc (== 1.0 when there is
+    # no previous frame) vetoes snow so the first sample of a window can't false-fire.
+    if prev_gray is not None:
+        a = prev_gray.astype(np.float64)
+        b = gray.astype(np.float64)
+        am, bm = a - a.mean(), b - b.mean()
+        denom = float(np.sqrt((am * am).sum()) * np.sqrt((bm * bm).sum())) + 1e-6
+        ncc = float((am * bm).sum() / denom)
+    else:
+        ncc = 1.0
+    is_snow = (lap > LAP_MIN and smooth < SMOOTH_MAX and mad > MAD_MIN
+               and ncc < NCC_MAX)
+    return {"lap": round(lap, 1), "smooth": round(smooth, 3), "mad": round(mad, 1),
+            "ncc": round(ncc, 3), "is_snow": is_snow}
 
 
 def scan_range(path, start, end, step=1.0):
@@ -123,7 +158,14 @@ def _video_duration(path):
 
 
 def snow_intervals(path, windows, step=1.0, min_len=2.0):
-    """Snow intervals within the given list of (start,end) windows."""
+    """Snow intervals within the given list of (start,end) windows.
+
+    Each positive sample represents a `step`-second window, so an interval's end is
+    extended by one step: this makes a real 2s snow burst (2 samples at step=1) span
+    ~2s and clear `min_len`, rather than the 1s a bare max-of-timestamps would give.
+    Priority is RECALL (a 2s burst MUST be flagged); the cost is that a lone-sample
+    blip becomes a ~1-step interval — still below min_len=2, so single stray frames are
+    dropped while genuine short bursts are kept."""
     snow_ts = []
     for s, e in windows:
         ts, _ = scan_range(path, s, e, step)
@@ -134,7 +176,7 @@ def snow_intervals(path, windows, step=1.0, min_len=2.0):
             intervals[-1][1] = t
         else:
             intervals.append([t, t])
-    return [(a, b) for a, b in intervals if b - a >= min_len]
+    return [(a, b + step) for a, b in intervals if (b + step) - a >= min_len]
 
 
 def main():

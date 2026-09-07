@@ -444,7 +444,11 @@ def split_on_topics(segments, boundaries, shots, min_piece=8.0, snap=3.0) -> lis
     """Split each speaker-continuity segment at boundaries that fall inside it. A
     boundary is snapped to a nearby shot cut when one is within `snap` seconds (keeps
     the edit on a visual cut), else used as-is -- a topic shift in a monologue has no
-    cut, which is exactly the mid-shot boundary lexical/pause candidates recover."""
+    cut, which is exactly the mid-shot boundary lexical/pause candidates recover.
+
+    min_piece stays small (8s): short unrelated clips are legitimate content from an
+    editing standpoint, so we do NOT suppress brief segments — the goal is accurate
+    boundaries, not a minimum segment length."""
     shot_starts = sorted({s["start"] for s in shots})
     out = []
     for seg in segments:
@@ -611,9 +615,14 @@ def label_segments(segments, client, taxonomy, video_path=None, model=BEDROCK_MO
     return out
 
 
-def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
+def coalesce_conversation(labeled, host="spk_0", segue_max=20.0, dead_spans=None) -> list:
     """Stage D (continuity view): merge segments into stories by WHO is talking,
     not by the per-shot visual label.
+
+    `dead_spans` (optional [{start,end} or objects with .start/.end]) are detected
+    tape splices (black/bars/snow). A splice is a HARD story boundary: the merge will
+    NOT bridge across a gap that contains a dead span, even for the same speaker —
+    so content on either side of a splice stays in separate segments.
 
     A continuous interview/tour with one guest is ONE story even when the backdrop
     -- and therefore the frame-driven label -- keeps changing. (Without this a
@@ -665,6 +674,22 @@ def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
                 g["speakers"].append(s)
         g["_children"].append(dict(seg))
 
+    # Normalize dead spans to (start, end) tuples once.
+    _spans = []
+    for ds in (dead_spans or []):
+        s = getattr(ds, "start", None)
+        e = getattr(ds, "end", None)
+        if s is None and isinstance(ds, dict):
+            s, e = ds.get("start"), ds.get("end")
+        if s is not None and e is not None:
+            _spans.append((float(s), float(e)))
+
+    def splice_between(a_end, b_start, tol=1.0):
+        """True if a detected dead span (tape splice) lies in the gap (a_end, b_start).
+        A splice there means the two pieces are different stories -> do not merge."""
+        lo, hi = min(a_end, b_start) - tol, max(a_end, b_start) + tol
+        return any(ds_s <= hi and ds_e >= lo for ds_s, ds_e in _spans)
+
     groups, pending = [], []      # pending = buffered host-only (bridge or lead-in)
     for s in labeled:
         gs = guests(s)
@@ -672,17 +697,23 @@ def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
             pending.append(s)
             continue
         cur = groups[-1] if groups else None
-        if cur and cur["guests"] and (gs & cur["guests"]):       # same guest resumes:
+        # Same guest resumes AND no tape splice sits in the gap between them (a splice
+        # separates stories even for the same speaker) -> merge, absorbing the bridge.
+        if (cur and cur["guests"] and (gs & cur["guests"])
+                and not splice_between(cur["end"], s["start"])):
             for hb in pending:                                   # pending is a bridge
                 absorb(cur, hb)                                  # (absorb, any length)
             pending = []
             absorb(cur, s)
-        else:                                                    # new/different guest
+        else:                                                    # new/different guest, or a splice
             # Only the trailing short run of host narration is this guest's lead-in
             # ("...and I met with Bob Hon"); any earlier, longer narration before it
             # stands on its own rather than being dragged into the interview.
             lead, acc = [], 0.0
-            while pending and acc + (pending[-1]["end"] - pending[-1]["start"]) <= segue_max:
+            # Don't pull a host lead-in across a splice: if a dead span sits between
+            # the pending host piece and this guest segment, it's not the lead-in.
+            while (pending and acc + (pending[-1]["end"] - pending[-1]["start"]) <= segue_max
+                   and not splice_between(pending[-1]["end"], s["start"])):
                 acc += pending[-1]["end"] - pending[-1]["start"]
                 lead.insert(0, pending.pop())
             for hb in pending:                                   # the long remainder
@@ -715,7 +746,8 @@ def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
     out = []
     for g in groups:
         if (out and out[-1]["label"] == g["label"]
-                and not out[-1]["guests"] and not g["guests"]):
+                and not out[-1]["guests"] and not g["guests"]
+                and not splice_between(out[-1]["end"], g["start"])):
             out[-1]["end"] = g["end"]
             out[-1]["on_screen_text"] = out[-1]["on_screen_text"] or g["on_screen_text"]
             for s in g["speakers"]:
@@ -726,6 +758,160 @@ def coalesce_conversation(labeled, host="spk_0", segue_max=20.0) -> list:
     return [{"start": g["start"], "end": g["end"], "label": g["label"],
              "name": g["name"], "description": g.get("description", ""),
              "speakers": g["speakers"], "on_screen_text": g["on_screen_text"]} for g in out]
+
+
+# ── Phase 2: program titles + video summary (Bedrock, best-effort) ───────────
+# These operate on the FINAL segment dicts (segment_start/end, segment_type, title,
+# caption, transcript, program_index) plus the programs[] list from grouping. All
+# calls are best-effort: any failure (no client, Bedrock error, bad JSON) leaves the
+# labels empty and never breaks the pipeline. Prompts are hardcoded for now.
+
+_INTRO_SEGS = 2   # how many leading/trailing content segments count as intro/closing
+_MAX_SPEECH = 1200  # cap transcript chars fed per program slot, to stay in budget
+
+
+def _looks_like_title_card(caption: str) -> bool:
+    """A short, mostly-uppercase caption reads as a title-card slate. (Local copy so
+    this module doesn't import main.py, which imports this module.)"""
+    c = (caption or "").strip()
+    if not c:
+        return False
+    letters = [ch for ch in c if ch.isalpha()]
+    if not letters:
+        return False
+    return len(c) <= 60 and sum(ch.isupper() for ch in letters) / len(letters) >= 0.7
+
+
+def _program_signals(programs, segments):
+    """Deterministic prompt-input assembly (no Bedrock). For each program, gather its
+    title-card captions, intro speech (first content segs), closing speech (last),
+    and the segment name/type list. Returns a list aligned to `programs`."""
+    out = []
+    for pr in programs:
+        idx = pr.get("program_index")
+        segs = [s for s in segments
+                if s.get("segment_type") != "D" and s.get("program_index") == idx]
+        segs.sort(key=lambda s: s.get("segment_start", 0))
+        title_cards = [c for c in (s.get("caption", "") for s in segs)
+                       if _looks_like_title_card(c)]
+        intro = " ".join((s.get("transcript") or "") for s in segs[:_INTRO_SEGS]).strip()[:_MAX_SPEECH]
+        closing = " ".join((s.get("transcript") or "") for s in segs[-_INTRO_SEGS:]).strip()[:_MAX_SPEECH]
+        names = [f"{s.get('segment_type', '')}: {s.get('title', '')}".strip(": ")
+                 for s in segs if (s.get("title") or "").strip()]
+        out.append({"title_cards": title_cards, "intro": intro,
+                    "closing": closing, "segment_names": names})
+    return out
+
+
+def _parse_json_object(text):
+    a, b = text.find("{"), text.rfind("}")
+    if a >= 0 and b > a:
+        try:
+            return json.loads(text[a:b + 1])
+        except Exception:
+            pass
+    return {}
+
+
+PROGRAM_TITLE_PROMPT = (
+    "You are cataloguing one PROGRAM (a single recording) from an archival tape.\n"
+    "Given its on-screen title cards, the opening (intro) speech, the closing speech, "
+    "and a list of its segments, identify:\n"
+    "- title: the program's title. STRONGLY PREFER an on-screen title card (e.g. a "
+    "slate like 'BETWEEN THE LINES'). If there is no clear title card, write a concise "
+    "DESCRIPTIVE title (3-8 words) from the intro/closing/segments.\n"
+    "- description: one sentence on what the program is.\n"
+    "- confidence: 'high' if a title card gave the title, else 'medium' or 'low'.\n"
+    "Reply with ONLY JSON: {\"title\": \"...\", \"description\": \"...\", \"confidence\": \"...\"}\n\n"
+)
+
+
+def label_programs(programs, segments, client, model=BEDROCK_MODEL):
+    """Best-effort per-program title + description via one Bedrock call each. Mutates
+    each program dict in place, adding title/description/confidence (empty on failure)."""
+    if not programs:
+        return programs
+    signals = _program_signals(programs, segments)
+    for pr, sig in zip(programs, signals):
+        pr.setdefault("title", "")
+        pr.setdefault("description", "")
+        pr.setdefault("confidence", "")
+        if client is None:
+            continue
+        cards = "; ".join(sig["title_cards"]) or "(none)"
+        body = (PROGRAM_TITLE_PROMPT
+                + f"Title cards: {cards}\n"
+                + f"Intro speech: {sig['intro'] or '(none)'}\n"
+                + f"Closing speech: {sig['closing'] or '(none)'}\n"
+                + f"Segments: {', '.join(sig['segment_names']) or '(none)'}\n")
+        try:
+            resp = client.messages.create(model=model, max_tokens=300,
+                                          messages=[{"role": "user", "content": body}])
+            text = "".join(b.text for b in resp.content if b.type == "text")
+            obj = _parse_json_object(text)
+            pr["title"] = str(obj.get("title", "")).strip()
+            pr["description"] = str(obj.get("description", "")).strip()
+            pr["confidence"] = str(obj.get("confidence", "")).strip()
+        except Exception as e:
+            print(f"WARN: program {pr.get('program_index')} labeling failed: {e}", file=sys.stderr)
+    return programs
+
+
+def title_single_program(segments, client, model=BEDROCK_MODEL):
+    """Title for a video that is ONE program (no multi-program tier). Reuses the exact
+    per-program titling logic (title cards + intro/closing + segment names) by treating
+    ALL content segments as a single synthetic program. Returns
+    {title, description, confidence} (empty strings on failure / no client).
+
+    This is what surfaces a program name (e.g. an on-screen slate like 'Lifestyles')
+    for single-program tapes, which get no `programs[]` tier."""
+    content = [s for s in segments if s.get("segment_type") != "D"]
+    if not content:
+        return {"title": "", "description": "", "confidence": ""}
+    # Synthetic single program spanning all content; program_index=0 so _program_signals
+    # (which filters segments by program_index) picks up every content segment.
+    for s in content:
+        s.setdefault("program_index", 0)
+    pseudo = [{"program_index": 0}]
+    label_programs(pseudo, segments, client, model=model)
+    # Don't leak the synthetic index onto the emitted segments.
+    for s in content:
+        if s.get("program_index") == 0:
+            s.pop("program_index", None)
+    p = pseudo[0]
+    return {"title": p.get("title", ""), "description": p.get("description", ""),
+            "confidence": p.get("confidence", "")}
+
+
+VIDEO_SUMMARY_PROMPT = (
+    "Summarize the contents of this archival video tape in 1-2 brief, high-level "
+    "sentences for a catalogue. Base it on the program titles (if any) and the segment "
+    "list below. Be concrete about topics/people/events; do not speculate.\n"
+    "Reply with ONLY the summary text, no preamble.\n\n"
+)
+
+
+def summarize_video(programs, segments, client, model=BEDROCK_MODEL, program_title=""):
+    """Best-effort 1-2 sentence high-level summary of the whole video. Returns a string
+    ('' on failure or no client). Generated for EVERY video, program tier or not.
+    `program_title` grounds the summary for a single-program tape (no `programs[]`)."""
+    if client is None:
+        return ""
+    prog_titles = [p.get("title", "") for p in (programs or []) if p.get("title")]
+    if program_title and not prog_titles:
+        prog_titles = [program_title]
+    names = [f"{s.get('segment_type', '')}: {s.get('title', '')}".strip(": ")
+             for s in segments if s.get("segment_type") != "D" and (s.get("title") or "").strip()]
+    body = (VIDEO_SUMMARY_PROMPT
+            + (f"Programs: {'; '.join(prog_titles)}\n" if prog_titles else "")
+            + f"Segments: {', '.join(names[:60]) or '(none)'}\n")
+    try:
+        resp = client.messages.create(model=model, max_tokens=200,
+                                      messages=[{"role": "user", "content": body}])
+        return "".join(b.text for b in resp.content if b.type == "text").strip()
+    except Exception as e:
+        print(f"WARN: video summary failed: {e}", file=sys.stderr)
+        return ""
 
 
 def main():

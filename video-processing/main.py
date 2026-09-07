@@ -106,10 +106,10 @@ _CATEGORY_KEYWORDS = (
 )
 
 
-def normalize_category(label: str) -> str:
-    """Fold a free-text content label (from Claude's per-program taxonomy) into one
-    of CONTENT_CATEGORIES. Unmatched or empty labels become 'other'."""
-    r = (label or "").strip().lower()
+def _match_category_keywords(text: str) -> str:
+    """First keyword hit in `text` → its category, else 'other'. Shared by the
+    label classifier and the title/description fallback."""
+    r = (text or "").strip().lower()
     if not r:
         return "other"
     if r in CONTENT_CATEGORIES:
@@ -120,10 +120,107 @@ def normalize_category(label: str) -> str:
     return "other"
 
 
+def normalize_category(label: str, *fallback_texts: str) -> str:
+    """Fold a free-text content label (from Claude's per-program taxonomy) into one
+    of CONTENT_CATEGORIES. Unmatched or empty labels become 'other'.
+
+    When the LABEL itself maps to 'other' (uninformative, e.g. Claude wrote "concert"
+    or a generic phrase with no category keyword), fall back to keyword-matching the
+    provided `fallback_texts` (the segment's title + description) so a segment plainly
+    described as a performance/interview/etc. still gets that type. The label always
+    wins when it is specific — the fallback only fires on an 'other' label."""
+    cat = _match_category_keywords(label)
+    if cat != "other":
+        return cat
+    for text in fallback_texts:
+        cat = _match_category_keywords(text)
+        if cat != "other":
+            return cat
+    return "other"
+
+
 def segment_key(s3_key: str) -> str:
     """Map an input key to its segment JSON key under segment/."""
     stem = Path(s3_key).name.rsplit(".", 1)[0]
     return f"{SEGMENT_PREFIX}/{stem}.json"
+
+
+# ── Program grouping (tape -> programs -> segments) ──────────────────────────
+# A tape may hold several recordings ("programs"). Content segments are grouped
+# into programs; a program often keeps the SAME speakers throughout even across
+# intervening clips, so a tape splice (snow) does NOT by itself start a new
+# program. A new program begins only where a snow splice COINCIDES with a change
+# of on-screen speakers OR a new title-card caption. Dead space and title-card-
+# only markers are NOT assigned to any program. Videos that are a single (or
+# nearly single) content segment get no program tier at all.
+PROGRAM_MIN_SEGMENTS = int(os.environ.get("PROGRAM_MIN_SEGMENTS", "3"))  # below this: no program tier
+
+# A caption that looks like a program/title-card slate (short, mostly caps/among
+# the few standalone words): a strong "new program starts here" signal.
+def _looks_like_title_card(caption: str) -> bool:
+    c = (caption or "").strip()
+    if not c:
+        return False
+    # A slate is short (a title, not a lower-third sentence) and largely uppercase.
+    letters = [ch for ch in c if ch.isalpha()]
+    if not letters:
+        return False
+    upper_frac = sum(ch.isupper() for ch in letters) / len(letters)
+    return len(c) <= 60 and upper_frac >= 0.7
+
+
+def group_into_programs(segments, snow_spans, tol=2.0):
+    """Assign a program_index to each CONTENT segment and return the programs list.
+
+    `segments` is the final flat list (content + 'D' markers). `snow_spans` is a
+    list of (start, end) for detected snow (the only splice kind that can delimit
+    programs). Returns (programs, changed) where `programs` is
+    [{program_index, program_start, program_end}] (labels filled in Phase 2) and
+    `changed` is False when no program tier applies (single/near-single segment):
+    in that case NO program_index is assigned.
+
+    Boundary rule: walking content segments in time order, a NEW program starts at
+    segment i (i>0) only if a snow splice lies between segment i-1 and i AND either
+    the speaker roster changed or segment i carries a title-card caption. Snow with
+    unchanged speakers and no title card stays the SAME program (an internal splice).
+    """
+    content = [s for s in segments if s.get("segment_type") != "D"]
+    # No program tier for a single / near-single content segment.
+    if len(content) < PROGRAM_MIN_SEGMENTS:
+        return [], False
+
+    def snow_between(a_end, b_start):
+        lo, hi = min(a_end, b_start) - tol, max(a_end, b_start) + tol
+        return any(ss <= hi and se >= lo for ss, se in (snow_spans or []))
+
+    programs = []
+    idx = -1
+    prev = None
+    for s in content:
+        start_new = prev is None
+        if prev is not None:
+            roster_prev = set(prev.get("speakers", []) or [])
+            roster_cur = set(s.get("speakers", []) or [])
+            roster_changed = bool(roster_prev) and bool(roster_cur) and roster_prev.isdisjoint(roster_cur)
+            has_title_card = _looks_like_title_card(s.get("caption", ""))
+            if snow_between(prev["segment_end"], s["segment_start"]) and (roster_changed or has_title_card):
+                start_new = True
+        if start_new:
+            idx += 1
+            programs.append({"program_index": idx,
+                             "program_start": s["segment_start"],
+                             "program_end": s["segment_end"]})
+        else:
+            programs[-1]["program_end"] = s["segment_end"]
+        s["program_index"] = idx
+        prev = s
+
+    # If everything landed in one program, there's no meaningful tier -> drop it.
+    if len(programs) <= 1:
+        for s in content:
+            s.pop("program_index", None)
+        return [], False
+    return programs, True
 
 
 _ORIG_NAME_CACHE: dict = {}
@@ -331,7 +428,8 @@ def head_leader_end(regions, *, max_head=HEAD_LEADER_MAX, gap=3.0):
     return end if end >= HEAD_LEADER_MIN else 0.0
 
 
-def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=None):
+def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=None,
+                            dead_spans=None, client=None):
     """Stages A-D: transcribe -> shots+fuse -> discover taxonomy/topics -> label.
 
     Transcribe reads the ORIGINAL S3 object (the frontend already uploaded it), so
@@ -370,7 +468,10 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=Non
 
     # --- C. discover taxonomy + multi-cue boundaries, split, then label multimodally ---
     t0 = time.time()
-    client = make_client()
+    # Reuse the caller's Bedrock client when provided (one per video across fusion +
+    # Phase 2 labeling); otherwise make one so standalone calls still work.
+    if client is None:
+        client = make_client()
     host = detect_host(turns)
     taxonomy, llm_bounds = analyze_program(turns, client)
     # Two more cue sources, both free from data we already have: TextTiling lexical
@@ -379,10 +480,18 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=Non
     # speaker-continuity coalesce removes any that fall inside one conversation.
     lex_bounds = lexical_boundaries(turns)
     pause_bounds = pause_boundaries(turns)
-    boundaries = sorted(set(llm_bounds) | set(lex_bounds) | set(pause_bounds))
+    # A detected tape splice (black/bars/snow dead span) is a HARD boundary: content
+    # on either side of it is a different item, so add each dead span's edges to the
+    # boundary set. This forces split_on_topics to cut at splices the LLM is blind to
+    # (it only sees transcript+frames), preventing a segment from spanning or extending
+    # through a splice. Only mid-window edges matter (head/tail are handled elsewhere).
+    dead_bounds = []
+    for ds in (dead_spans or []):
+        dead_bounds += [round(ds.start, 2), round(ds.end, 2)]
+    boundaries = sorted(set(llm_bounds) | set(lex_bounds) | set(pause_bounds) | set(dead_bounds))
     log.info(f"[C] host={host} | taxonomy: " + ", ".join(t["type"] for t in taxonomy)
              + f" | {len(boundaries)} boundaries (LLM {len(llm_bounds)} + lexical "
-             f"{len(lex_bounds)} + pause {len(pause_bounds)})")
+             f"{len(lex_bounds)} + pause {len(pause_bounds)} + dead {len(dead_bounds)})")
 
     segments = merge_by_speaker(fused, host=host)
     segments = split_on_topics(segments, boundaries, fused)
@@ -396,7 +505,9 @@ def run_fusion_segmentation(local_video_path, s3_bucket, s3_key, prop, turns=Non
     labeled = label_segments(segments, client, taxonomy, str(local_video_path), host=host)
     # --- D. coalesce by conversation continuity (guest speaker), not visual label:
     # a continuous interview stays ONE segment even when the camera keeps cutting.
-    labeled = coalesce_conversation(labeled, host=host)
+    # Dead spans are passed so the merge NEVER bridges across a tape splice, even for
+    # the same speaker — a splice always separates stories.
+    labeled = coalesce_conversation(labeled, host=host, dead_spans=dead_spans)
     # Score each final boundary by how many independent cues agree, for reviewer triage.
     shot_starts = sorted({s["start"] for s in fused})
     labeled = boundary_confidence(labeled, turns, shot_starts, llm_bounds, lex_bounds, host)
@@ -466,7 +577,7 @@ def run_visual_segmentation(local_video_path, prop):
 
 
 def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
-                       turns=None, mid_dead_spans=None) -> dict:
+                       turns=None, mid_dead_spans=None, client=None) -> dict:
     """Build a segment JSON matching SCUA Editor format.
 
     `mid_dead_spans` are DeadSpan objects that fall BETWEEN content (e.g. a color
@@ -510,10 +621,13 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
         for seg in content_segments:
             label = seg.get("label", "other")
             name = (seg.get("name") or "").strip()
+            description = (seg.get("description") or "").strip()
             # segment_type is the NORMALIZED content category (see CONTENT_CATEGORIES),
             # folded from Claude's per-program label. The frontend color-codes by it.
-            # (Dead-space segments keep the separate "D" code.)
-            category = normalize_category(label)
+            # When the label is uninformative ('other'), fall back to the title +
+            # description so a segment plainly described as a performance/interview/etc.
+            # still gets that type. (Dead-space segments keep the separate "D" code.)
+            category = normalize_category(label, name, description)
             segments.append({
                 "segment_start": round(seg["start"], 2),
                 "segment_end": round(seg["end"], 2),
@@ -573,24 +687,55 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
                     "white": "White gap (auto-detected)",
                     "mixed": "Dead space (auto-detected)"}
     if mid_dead_spans:
+        # Carve a content segment around a dead span WITHOUT cloning its transcript
+        # onto both halves. Each carved piece gets its transcript RE-SLICED to its own
+        # (narrower) span — otherwise a segment spanning a black gap ends up duplicated
+        # on both sides (same transcript/title), and an over-long content tail extending
+        # into a dead stretch becomes a phantom copy on the dead side. A carved piece
+        # that comes out blank (no words, no caption) is itself dead space (it was only
+        # a clone of a neighbour's metadata over a silent stretch), so it is relabeled
+        # as a "D" marker instead of a bogus content segment — keeping the timeline
+        # gapless while not manufacturing content out of dead space.
+        def _carve_piece(seg, new_start, new_end):
+            piece = dict(seg)
+            piece["segment_start"], piece["segment_end"] = new_start, new_end
+            piece["transcript"] = _transcript(new_start, new_end)
+            return piece
+
+        def _is_blank_phantom(piece):
+            # Blank = no transcribed words and no on-screen caption. A real silent
+            # performance carries a caption/label/frame, so this only catches pieces
+            # that are genuinely empty content (dead-region residue from the carve).
+            return not (piece.get("transcript") or "").strip() and not (piece.get("caption") or "").strip()
+
+        def _dead_piece(new_start, new_end):
+            return {"segment_start": new_start, "segment_end": new_end,
+                    "segment_type": "D", "title": "Dead space (auto-detected)"}
+
         for ds in mid_dead_spans:
             ds_start, ds_end = round(ds.start, 2), round(ds.end, 2)
             if ds_end - ds_start < 0.5:
                 continue
             carved = []
             for seg in segments:
+                # Dead markers already placed pass through untouched.
+                if seg.get("segment_type") == "D":
+                    carved.append(seg)
+                    continue
                 s0, s1 = seg["segment_start"], seg["segment_end"]
                 # No overlap → keep as-is
                 if ds_end <= s0 or ds_start >= s1:
                     carved.append(seg)
                     continue
-                # Overlap: keep the portion(s) of this segment outside the dead span
+                # Overlap: keep the portion(s) of this segment outside the dead span,
+                # each with its transcript re-sliced to the kept span. A carved piece
+                # that comes out blank is relabeled as dead space (keeps timeline gapless).
                 if s0 < ds_start:
-                    left = dict(seg); left["segment_end"] = ds_start
-                    carved.append(left)
+                    left = _carve_piece(seg, s0, ds_start)
+                    carved.append(_dead_piece(s0, ds_start) if _is_blank_phantom(left) else left)
                 if s1 > ds_end:
-                    right = dict(seg); right["segment_start"] = ds_end
-                    carved.append(right)
+                    right = _carve_piece(seg, ds_end, s1)
+                    carved.append(_dead_piece(ds_end, s1) if _is_blank_phantom(right) else right)
                 # (the middle, [ds_start,ds_end], is replaced by the dead marker below)
             carved.append({
                 "segment_start": ds_start,
@@ -611,6 +756,36 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
         segments[0]["segment_start"] = 0
         segments[-1]["segment_end"] = round(prop.duration, 2)
 
+    # Group content segments into programs (tape -> programs -> segments). Only when
+    # there's real content segmentation and more than one/near-one content segment;
+    # snow splices delimit programs ONLY when they coincide with a speaker change or a
+    # new title card (a program keeps its speakers across intervening clips/splices).
+    programs = []
+    if content_segments:
+        snow_spans = [(round(ds.start, 2), round(ds.end, 2))
+                      for ds in (mid_dead_spans or []) if getattr(ds, "kind", "") == "snow"]
+        programs, _ = group_into_programs(segments, snow_spans)
+
+    # Phase 2 (best-effort Bedrock): title each program (title cards + intro/closing),
+    # and generate a brief high-level summary for EVERY video. Empty/skip on any failure
+    # or when no client is available — never blocks segment JSON output.
+    video_summary = ""
+    single_program = {}
+    if content_segments:
+        try:
+            from segment_label import (label_programs, summarize_video,
+                                        title_single_program)
+            if programs:
+                label_programs(programs, segments, client)
+            else:
+                # Single-program tape: still give it ONE program title (from the same
+                # title-card / intro / closing signals) so the video has a program name.
+                single_program = title_single_program(segments, client)
+            video_summary = summarize_video(programs, segments, client,
+                                            program_title=single_program.get("title", ""))
+        except Exception as e:
+            log.warning(f"Program/summary labeling skipped: {e}")
+
     out = {
         "video": stem,
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -621,6 +796,20 @@ def build_segment_json(s3_key: str, prop, content_segments=None, taxonomy=None,
         "kept_pct": round(prop.kept_pct, 1),
         "segments": segments,
     }
+    if video_summary:
+        # High-level catalogue summary of the whole video (generated for every video).
+        out["summary"] = video_summary
+    if programs:
+        # Program tier with LLM-guessed title/description (Phase 2), human-editable.
+        # Absent for single-program / single-segment videos.
+        out["programs"] = programs
+    elif single_program.get("title"):
+        # Single-program tape: one program name for the whole video (human-editable).
+        out["program_title"] = single_program["title"]
+        if single_program.get("description"):
+            out["program_description"] = single_program["description"]
+        if single_program.get("confidence"):
+            out["program_confidence"] = single_program["confidence"]
     if taxonomy:
         # The per-video content types the model discovered, so the Editor can show
         # (and let a human correct) the vocabulary the labels came from.
@@ -871,6 +1060,17 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             stage2_start = time.time()
             content_segments, taxonomy, transcript_turns = None, None, None
 
+            # ONE Bedrock client per video, shared across fusion labeling (Stage 2) and
+            # Phase 2 program-title/summary labeling (build_segment_json). Best-effort:
+            # if it can't be created, segmentation still runs (labels/summary stay empty).
+            label_client = None
+            if _should_run_content_segmentation():
+                try:
+                    from bedrock import make_client
+                    label_client = make_client()
+                except Exception as e:
+                    log.warning(f"Bedrock client unavailable (labels/summary will be empty): {e}")
+
             # Segmentation is decoupled from the dead-space VERDICT: a NEEDS_REVIEW trim
             # (odd leader, short clip, over-eager detectors) should still yield a
             # segmented timeline, not one big block. When the trim is OK we segment the
@@ -902,7 +1102,9 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
                 try:
                     content_segments, taxonomy, transcript_turns = run_fusion_segmentation(
                         local_video_path, s3_bucket, s3_key, seg_prop,
-                        turns=prefetched_turns)
+                        turns=prefetched_turns,
+                        dead_spans=(full_analysis.dead_spans if full_analysis else None),
+                        client=label_client)
                     log.info(f"Fusion segmentation complete: {len(content_segments)} segments "
                              f"in {time.time() - stage2_start:.2f}s")
                     for s in content_segments:
@@ -954,8 +1156,12 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             # Always write segment JSON so the Editor can display it. Use `seg_prop`
             # (not `prop`) so the head/tail dead-space markers match the window the
             # segments were actually computed over.
+            # Phase 2 program-title + video-summary labeling reuses the SAME Bedrock
+            # client created above (one per video); best-effort, so a None client just
+            # leaves labels/summary empty.
             seg_json = build_segment_json(s3_key, seg_prop, content_segments, taxonomy,
-                                          transcript_turns, mid_dead_spans=mid_dead_spans)
+                                          transcript_turns, mid_dead_spans=mid_dead_spans,
+                                          client=label_client)
             log.info(f"Uploading segment JSON to s3://{s3_bucket}/{seg_s3_key}")
             s3_client.put_object(
                 Bucket=s3_bucket,

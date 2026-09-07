@@ -202,6 +202,65 @@ def classify_window(client, jpegs, model=CLASSIFY_MODEL, interval=30.0,
     return category, desc
 
 
+BATCH_PROMPT = (
+    "Below are frames from {k} separate shots of a video, in time order. Each shot is "
+    "introduced by a line 'SHOT <i>:' followed by that shot's frames. For EACH shot, "
+    "look at its frames together (motion, setting, on-screen graphics) and classify it "
+    "into EXACTLY ONE of these content types:\n{categories}\n"
+    "If a shot matches none, use 'other'. Then describe it in 1-3 words.\n"
+    "Reply with ONE line per shot, nothing else, in this exact format:\n"
+    "<shot index> / <category or other> / <short description>\n"
+    "Example:\n0 / interview / studio interview\n1 / other / weather forecast"
+)
+
+
+def _parse_batch_lines(text, categories):
+    """Parse the batch reply into {shot_index: (category, description)}. Tolerates
+    missing/extra lines and blank descriptions; anything unparsed is simply absent
+    (caller defaults it)."""
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or "/" not in line:
+            continue
+        idx_str, _, rest = line.partition("/")
+        idx_str = idx_str.strip().lstrip("#").strip()
+        if not idx_str.isdigit():
+            continue
+        cat_str, _, desc = rest.partition("/")
+        category = _canonical(cat_str, categories)
+        d = desc.strip().lower()[:40]
+        if category == OTHER and not d:
+            d = cat_str.strip().lower()[:40]
+        out[int(idx_str)] = (category, d)
+    return out
+
+
+def classify_shots_batch(client, shots_jpegs, model=CLASSIFY_MODEL, categories=None):
+    """Classify SEVERAL shots in ONE multimodal call. `shots_jpegs` is a list of
+    per-shot JPEG lists (base64). Returns a list of (category, description) aligned to
+    `shots_jpegs`; any shot the reply omits defaults to (OTHER, '') so one ragged reply
+    can't drop a whole batch. This is the batched analogue of classify_window — same
+    closed-set contract, ~1/len(batch) the calls."""
+    categories = categories or CATEGORIES
+    k = len(shots_jpegs)
+    content = []
+    for i, jpegs in enumerate(shots_jpegs):
+        content.append({"type": "text", "text": f"SHOT {i}:"})
+        for j in jpegs:
+            content.append({"type": "image", "source": {"type": "base64",
+                                                         "media_type": "image/jpeg", "data": j}})
+    content.append({"type": "text", "text": BATCH_PROMPT.format(
+        k=k, categories=_render_categories(categories))})
+    from bedrock import create_with_retry
+    resp = create_with_retry(
+        client, model=model, max_tokens=24 * k + 32,
+        messages=[{"role": "user", "content": content}])
+    text = "".join(b.text for b in resp.content if b.type == "text").strip()
+    parsed = _parse_batch_lines(text, categories)
+    return [parsed.get(i, (OTHER, "")) for i in range(k)]
+
+
 def label_windows(windows, model=CLASSIFY_MODEL, interval=30.0, categories=None) -> list:
     """Classify each window. Returns [(t, category, description)].
     The Bedrock client is built here (not at import) so --no-classify never
