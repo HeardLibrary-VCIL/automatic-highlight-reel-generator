@@ -204,8 +204,20 @@ def lambda_handler(event, context):
         for record in event['Records']:
             bucket = record['s3']['bucket']['name']
             key = unquote_plus(record['s3']['object']['key'])
-            
-            logger.info(f"Processing file: s3://{bucket}/{key}")
+            event_name = record.get('eventName', '')
+
+            logger.info(f"Processing file: s3://{bucket}/{key} ({event_name})")
+
+            # A rename in the editor moves a video by copying it to the new key
+            # (SCUA-Video-Editing src/utils/rename.ts). Treating that copy as a new
+            # upload would re-run the whole pipeline and overwrite the segment JSON
+            # the rename just moved, losing the user's manual edits. The bucket
+            # notification already excludes Copy; this also holds if that config
+            # drifts or a legacy ObjectCreated:* rule is still in place.
+            if event_name.startswith('ObjectCreated:Copy'):
+                logger.info(f"Skipping {key}: internal copy (rename), not a new upload")
+                skipped_files.append({'key': key, 'reason': 'Internal copy, not a new upload'})
+                continue
             
             # Route: edit/*_trim_request.json → trim mode
             if key.startswith('edit/') and key.endswith('_trim_request.json'):
