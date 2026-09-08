@@ -279,10 +279,17 @@ def handler(event, context):
                               if c.get('LambdaFunctionArn') != lambda_arn and c.get('Id') not in our_ids]
 
             # video/ uploads -> segment detection.
+            # Real uploads only, NOT ObjectCreated:Copy. The editor renames a video
+            # by copying it to the new key (SCUA-Video-Editing src/utils/rename.ts),
+            # and on 'Copy' this rule would re-run the whole pipeline over the
+            # renamed object -- burning Bedrock quota and overwriting the segment
+            # JSON the rename just moved, destroying the user's manual edits.
             lambda_configs.append({
                 'Id': notification_id,
                 'LambdaFunctionArn': lambda_arn,
-                'Events': ['s3:ObjectCreated:*'],
+                'Events': ['s3:ObjectCreated:Put',
+                           's3:ObjectCreated:Post',
+                           's3:ObjectCreated:CompleteMultipartUpload'],
                 'Filter': {
                     'Key': {
                         'FilterRules': [
