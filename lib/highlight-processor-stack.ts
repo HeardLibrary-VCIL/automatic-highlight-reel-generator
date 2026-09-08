@@ -8,6 +8,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
+import { createHash } from 'crypto';
 
 export class HighlightProcessorStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -245,11 +246,10 @@ export class HighlightProcessorStack extends cdk.Stack {
     });
 
     // Custom resource to add notification to the existing Amplify bucket
-    const notificationHandler = new lambda.Function(this, 'S3NotificationHandler', {
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: 'index.handler',
-      timeout: cdk.Duration.minutes(2),
-      code: lambda.Code.fromInline(`
+    // Held in a variable so the custom resource below can hash it: CloudFormation
+    // re-invokes a custom resource only when its PROPERTIES change, so editing this
+    // handler updated the Lambda but left the bucket on its previous configuration.
+    const notificationHandlerSource = `
 import boto3
 import cfnresponse
 import json
@@ -352,7 +352,13 @@ def handler(event, context):
     except Exception as e:
         print(f"Error: {e}")
         cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, STABLE_ID)
-`),
+`;
+
+    const notificationHandler = new lambda.Function(this, 'S3NotificationHandler', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.handler',
+      timeout: cdk.Duration.minutes(2),
+      code: lambda.Code.fromInline(notificationHandlerSource),
     });
 
     // The notification handler must manage the CURRENT bucket, but on a BucketName
@@ -376,6 +382,10 @@ def handler(event, context):
         BucketName: amplifyBucketName.valueAsString,
         LambdaArn: triggerLambda.functionArn,
         NotificationId: 'scua-video-trim-trigger',
+        // Changes whenever the handler above does, which is what makes
+        // CloudFormation actually re-run it. Without this, a change to the
+        // notification rules deploys cleanly and has no effect on the bucket.
+        HandlerVersion: createHash('sha256').update(notificationHandlerSource).digest('hex').slice(0, 16),
       },
     });
 
