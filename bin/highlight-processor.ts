@@ -32,9 +32,21 @@ new HighlightProcessorStack(app, 'HighlightProcessorStack', {
 
 // DEV: same pipeline on Fargate (serverless, no idle EC2 cost), wired to the
 // Amplify DEV bucket. No VPC/NAT of its own beyond a NAT-free public-subnet VPC.
-//   npx cdk deploy HighlightProcessorDevStack \
-//     --parameters AmplifyBucketName=<dev bucket from the dev amplify_outputs.json>
-new HighlightProcessorStack(app, 'HighlightProcessorDevStack', {
+//
+// Students: deploy your OWN isolated copy without editing this file by passing a
+// unique suffix via context. It becomes both the CloudFormation stack name and the
+// suffix on every scoped resource (log groups, task family, S3 notification id), so
+// your deployment never collides with a classmate's:
+//   npx cdk deploy HighlightProcessorDevStack-jane \
+//     -c devSuffix=jane \
+//     --parameters AmplifyBucketName=<your dev amplify bucket> \
+//     --profile scua-vcil
+// With no devSuffix, the id stays the shared 'HighlightProcessorDevStack'.
+const devSuffix = app.node.tryGetContext('devSuffix') as string | undefined;
+const devStackId = devSuffix
+  ? `HighlightProcessorDevStack-${devSuffix}`
+  : 'HighlightProcessorDevStack';
+new HighlightProcessorStack(app, devStackId, {
   env,
   envName: 'dev',
 });
