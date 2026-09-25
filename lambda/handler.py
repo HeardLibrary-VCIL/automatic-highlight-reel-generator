@@ -12,6 +12,118 @@ logger.setLevel(logging.INFO)
 # Initialize AWS clients
 ecs = boto3.client('ecs')
 s3 = boto3.client('s3')
+dynamodb = boto3.client('dynamodb')
+
+
+def _stem_from_key(key):
+    """'video/RCC_10.mp4' -> 'RCC_10' (the row id convention the frontend uses)."""
+    return Path(key).name.rsplit('.', 1)[0]
+
+
+def ensure_video_row(bucket, key, file_info):
+    """Create a DynamoDB Video row for a video/* object if one doesn't already exist.
+
+    Covers videos copied DIRECTLY into the bucket (bypassing the app's Upload flow,
+    which is what normally writes the row): the site lists videos from DynamoDB, so
+    without a row a directly-copied video is processed but never appears in the UI.
+
+    Idempotent: a conditional PutItem with attribute_not_exists(id) no-ops when a row
+    already exists (e.g. the app upload created it, or a prior copy did). Best-effort —
+    a failure here must not stop segmentation, so it never raises.
+
+    Row shape mirrors src/pages/Upload.tsx: id = filename stem, displayName = original
+    filename, s3Key = the object key, videoType 'original', status 'ready'. Amplify
+    system fields (__typename, createdAt, updatedAt) are set so the Amplify client can
+    deserialize the row.
+    """
+    table = os.environ.get('VIDEO_TABLE_NAME', '').strip()
+    if not table:
+        logger.warning("VIDEO_TABLE_NAME not set — skipping DynamoDB row creation for %s", key)
+        return
+
+    row_id = _stem_from_key(key)
+    # Prefer the original filename stamped as object metadata; fall back to the key.
+    meta = (file_info or {}).get('metadata') or {}
+    display_name = meta.get('original-filename') or Path(key).name
+    size_bytes = int((file_info or {}).get('size') or 0)
+    now = _iso_now()
+
+    item = {
+        'id': {'S': row_id},
+        '__typename': {'S': 'Video'},
+        'displayName': {'S': display_name},
+        's3Key': {'S': key},
+        'videoType': {'S': 'original'},
+        'status': {'S': 'ready'},
+        'sizeBytes': {'N': str(size_bytes)},
+        'createdAt': {'S': now},
+        'updatedAt': {'S': now},
+    }
+
+    try:
+        dynamodb.put_item(
+            TableName=table,
+            Item=item,
+            # Only insert when no row with this id exists — the "if it doesn't already
+            # exist" requirement. An existing row (from the app upload) is left as-is.
+            ConditionExpression='attribute_not_exists(id)',
+        )
+        logger.info("Created DynamoDB Video row id=%s for %s", row_id, key)
+    except dynamodb.exceptions.ConditionalCheckFailedException:
+        logger.info("DynamoDB Video row id=%s already exists — leaving as-is", row_id)
+    except Exception as e:
+        # Best-effort: never block processing on the bookkeeping row.
+        logger.error("Failed to create DynamoDB Video row for %s: %s", key, e)
+
+
+def _iso_now():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')
+
+
+def _run_processor_task(container_env):
+    """Start the video-processor ECS task with the given container env overrides.
+
+    Launch-type agnostic: if LAUNCH_TYPE is set (e.g. 'FARGATE' — the dev stack),
+    launch with that; otherwise fall back to CAPACITY_PROVIDER_NAME (the EC2/ASG
+    prod stack). Both stacks share this handler, so it must support either.
+    Returns the raw ecs.run_task response."""
+    cluster = os.environ['CLUSTER_NAME']
+    task_definition = os.environ['TASK_DEFINITION']
+    subnet_ids = os.environ['SUBNET_IDS'].split(',')
+    security_group = os.environ['SECURITY_GROUP']
+    assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
+
+    kwargs = {
+        'cluster': cluster,
+        'taskDefinition': task_definition,
+        'count': 1,
+        'networkConfiguration': {
+            'awsvpcConfiguration': {
+                'subnets': subnet_ids,
+                'assignPublicIp': assign_public_ip,
+                'securityGroups': [security_group],
+            }
+        },
+        'overrides': {
+            'containerOverrides': [{
+                'name': 'video-processor',
+                'environment': container_env,
+            }]
+        },
+    }
+
+    launch_type = os.environ.get('LAUNCH_TYPE', '').strip()
+    if launch_type:
+        # Fargate (dev): serverless, pay-per-task, no ASG/instances.
+        kwargs['launchType'] = launch_type
+    else:
+        # EC2/ASG (prod): route onto the capacity provider.
+        kwargs['capacityProviderStrategy'] = [
+            {'capacityProvider': os.environ['CAPACITY_PROVIDER_NAME'], 'weight': 1},
+        ]
+
+    return ecs.run_task(**kwargs)
 
 # Supported video file extensions
 SUPPORTED_VIDEO_EXTENSIONS = {
@@ -76,41 +188,13 @@ def launch_trim_task(bucket, trim_request_key):
             logger.error(f"Trim request missing video_key: {trim_request_key}")
             return {'key': trim_request_key, 'reason': 'Missing video_key'}
 
-        # Get environment variables
-        cluster = os.environ['CLUSTER_NAME']
-        task_definition = os.environ['TASK_DEFINITION']
-        subnet_ids = os.environ['SUBNET_IDS'].split(',')
-        security_group = os.environ['SECURITY_GROUP']
-        assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
-        capacity_provider_name = os.environ['CAPACITY_PROVIDER_NAME']
-
         # Start ECS task in TRIM mode
-        response = ecs.run_task(
-            cluster=cluster,
-            capacityProviderStrategy=[
-                {'capacityProvider': capacity_provider_name, 'weight': 1},
-            ],
-            taskDefinition=task_definition,
-            count=1,
-            networkConfiguration={
-                'awsvpcConfiguration': {
-                    'subnets': subnet_ids,
-                    'assignPublicIp': assign_public_ip,
-                    'securityGroups': [security_group]
-                }
-            },
-            overrides={
-                'containerOverrides': [{
-                    'name': 'video-processor',
-                    'environment': [
-                        {'name': 'S3_BUCKET', 'value': bucket},
-                        {'name': 'S3_KEY', 'value': video_key},
-                        {'name': 'TRIM_REQUEST_KEY', 'value': trim_request_key},
-                        {'name': 'MODE', 'value': 'trim'},
-                    ]
-                }]
-            }
-        )
+        response = _run_processor_task([
+            {'name': 'S3_BUCKET', 'value': bucket},
+            {'name': 'S3_KEY', 'value': video_key},
+            {'name': 'TRIM_REQUEST_KEY', 'value': trim_request_key},
+            {'name': 'MODE', 'value': 'trim'},
+        ])
 
         if response.get('failures'):
             failure = response['failures'][0]
@@ -138,40 +222,12 @@ def launch_segment_task(bucket, segment_request_key):
             logger.error(f"Segment request missing video_key: {segment_request_key}")
             return {'key': segment_request_key, 'reason': 'Missing video_key'}
 
-        # Get environment variables
-        cluster = os.environ['CLUSTER_NAME']
-        task_definition = os.environ['TASK_DEFINITION']
-        subnet_ids = os.environ['SUBNET_IDS'].split(',')
-        security_group = os.environ['SECURITY_GROUP']
-        assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
-        capacity_provider_name = os.environ['CAPACITY_PROVIDER_NAME']
-
         # Start ECS task in detect mode (re-segmentation)
-        response = ecs.run_task(
-            cluster=cluster,
-            capacityProviderStrategy=[
-                {'capacityProvider': capacity_provider_name, 'weight': 1},
-            ],
-            taskDefinition=task_definition,
-            count=1,
-            networkConfiguration={
-                'awsvpcConfiguration': {
-                    'subnets': subnet_ids,
-                    'assignPublicIp': assign_public_ip,
-                    'securityGroups': [security_group]
-                }
-            },
-            overrides={
-                'containerOverrides': [{
-                    'name': 'video-processor',
-                    'environment': [
-                        {'name': 'S3_BUCKET', 'value': bucket},
-                        {'name': 'S3_KEY', 'value': video_key},
-                        {'name': 'MODE', 'value': 'detect'},
-                    ]
-                }]
-            }
-        )
+        response = _run_processor_task([
+            {'name': 'S3_BUCKET', 'value': bucket},
+            {'name': 'S3_KEY', 'value': video_key},
+            {'name': 'MODE', 'value': 'detect'},
+        ])
 
         if response.get('failures'):
             failure = response['failures'][0]
@@ -250,50 +306,15 @@ def lambda_handler(event, context):
             
             logger.info(f"Valid video file detected: {key} ({file_info['size']} bytes, {file_info['content_type']})")
 
-            # Get environment variables
-            cluster = os.environ['CLUSTER_NAME']
-            task_definition = os.environ['TASK_DEFINITION']
-            subnet_ids = os.environ['SUBNET_IDS'].split(',')
-            security_group = os.environ['SECURITY_GROUP']
-            assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
-            capacity_provider_name = os.environ['CAPACITY_PROVIDER_NAME']
+            # Ensure a DynamoDB Video row exists (creates one for videos copied
+            # directly into the bucket; no-ops when the app upload already made it).
+            ensure_video_row(bucket, key, file_info)
 
-            # Start ECS task
-            response = ecs.run_task(
-                cluster=cluster,
-                capacityProviderStrategy=[
-                    {
-                        'capacityProvider': capacity_provider_name,
-                        'weight': 1,
-                    },
-                ],
-                taskDefinition=task_definition,
-                count=1,
-                networkConfiguration={
-                    'awsvpcConfiguration': {
-                        'subnets': subnet_ids,
-                        'assignPublicIp': assign_public_ip,
-                        'securityGroups': [security_group]
-                    }
-                },
-                overrides={
-                    'containerOverrides': [
-                        {
-                            'name': 'video-processor',
-                            'environment': [
-                                {
-                                    'name': 'S3_BUCKET',
-                                    'value': bucket
-                                },
-                                {
-                                    'name': 'S3_KEY',
-                                    'value': key
-                                }
-                            ]
-                        }
-                    ]
-                }
-            )
+            # Start ECS task (segment-detection mode)
+            response = _run_processor_task([
+                {'name': 'S3_BUCKET', 'value': bucket},
+                {'name': 'S3_KEY', 'value': key},
+            ])
             
             # Check for failures from the API call and log them clearly
             if response.get('failures'):
