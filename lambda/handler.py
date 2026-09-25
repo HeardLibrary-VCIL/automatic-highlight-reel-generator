@@ -64,6 +64,129 @@ def validate_video_file(bucket, key):
     except Exception as e:
         return False, f"Error validating file: {str(e)}", None
 
+def launch_trim_task(bucket, trim_request_key):
+    """Launch an ECS task in TRIM mode using the trim request JSON."""
+    try:
+        # Read the trim request to get the video key
+        response = s3.get_object(Bucket=bucket, Key=trim_request_key)
+        trim_data = json.loads(response['Body'].read().decode('utf-8'))
+        video_key = trim_data.get('video_key', '')
+        
+        if not video_key:
+            logger.error(f"Trim request missing video_key: {trim_request_key}")
+            return {'key': trim_request_key, 'reason': 'Missing video_key'}
+
+        # Get environment variables
+        cluster = os.environ['CLUSTER_NAME']
+        task_definition = os.environ['TASK_DEFINITION']
+        subnet_ids = os.environ['SUBNET_IDS'].split(',')
+        security_group = os.environ['SECURITY_GROUP']
+        assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
+        capacity_provider_name = os.environ['CAPACITY_PROVIDER_NAME']
+
+        # Start ECS task in TRIM mode
+        response = ecs.run_task(
+            cluster=cluster,
+            capacityProviderStrategy=[
+                {'capacityProvider': capacity_provider_name, 'weight': 1},
+            ],
+            taskDefinition=task_definition,
+            count=1,
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': subnet_ids,
+                    'assignPublicIp': assign_public_ip,
+                    'securityGroups': [security_group]
+                }
+            },
+            overrides={
+                'containerOverrides': [{
+                    'name': 'video-processor',
+                    'environment': [
+                        {'name': 'S3_BUCKET', 'value': bucket},
+                        {'name': 'S3_KEY', 'value': video_key},
+                        {'name': 'TRIM_REQUEST_KEY', 'value': trim_request_key},
+                        {'name': 'MODE', 'value': 'trim'},
+                    ]
+                }]
+            }
+        )
+
+        if response.get('failures'):
+            failure = response['failures'][0]
+            logger.error(f"ECS trim task failed: {failure.get('reason')}")
+            return {'key': trim_request_key, 'reason': f"ECS failed: {failure.get('reason')}"}
+
+        task_arn = response['tasks'][0]['taskArn']
+        logger.info(f"Started ECS trim task: {task_arn}")
+        return {'key': trim_request_key, 'task_arn': task_arn, 'mode': 'trim'}
+
+    except Exception as e:
+        logger.error(f"Error launching trim task: {e}")
+        return {'key': trim_request_key, 'reason': str(e)}
+
+
+def launch_segment_task(bucket, segment_request_key):
+    """Launch an ECS task in DETECT mode (re-segmentation) using the segment request JSON."""
+    try:
+        # Read the segment request to get the video key
+        response = s3.get_object(Bucket=bucket, Key=segment_request_key)
+        seg_data = json.loads(response['Body'].read().decode('utf-8'))
+        video_key = seg_data.get('video_key', '')
+
+        if not video_key:
+            logger.error(f"Segment request missing video_key: {segment_request_key}")
+            return {'key': segment_request_key, 'reason': 'Missing video_key'}
+
+        # Get environment variables
+        cluster = os.environ['CLUSTER_NAME']
+        task_definition = os.environ['TASK_DEFINITION']
+        subnet_ids = os.environ['SUBNET_IDS'].split(',')
+        security_group = os.environ['SECURITY_GROUP']
+        assign_public_ip = os.environ['ASSIGN_PUBLIC_IP']
+        capacity_provider_name = os.environ['CAPACITY_PROVIDER_NAME']
+
+        # Start ECS task in detect mode (re-segmentation)
+        response = ecs.run_task(
+            cluster=cluster,
+            capacityProviderStrategy=[
+                {'capacityProvider': capacity_provider_name, 'weight': 1},
+            ],
+            taskDefinition=task_definition,
+            count=1,
+            networkConfiguration={
+                'awsvpcConfiguration': {
+                    'subnets': subnet_ids,
+                    'assignPublicIp': assign_public_ip,
+                    'securityGroups': [security_group]
+                }
+            },
+            overrides={
+                'containerOverrides': [{
+                    'name': 'video-processor',
+                    'environment': [
+                        {'name': 'S3_BUCKET', 'value': bucket},
+                        {'name': 'S3_KEY', 'value': video_key},
+                        {'name': 'MODE', 'value': 'detect'},
+                    ]
+                }]
+            }
+        )
+
+        if response.get('failures'):
+            failure = response['failures'][0]
+            logger.error(f"ECS segment task failed: {failure.get('reason')}")
+            return {'key': segment_request_key, 'reason': f"ECS failed: {failure.get('reason')}"}
+
+        task_arn = response['tasks'][0]['taskArn']
+        logger.info(f"Started ECS segment task: {task_arn}")
+        return {'key': segment_request_key, 'task_arn': task_arn, 'mode': 'detect'}
+
+    except Exception as e:
+        logger.error(f"Error launching segment task: {e}")
+        return {'key': segment_request_key, 'reason': str(e)}
+
+
 def lambda_handler(event, context):
     """
     Lambda function triggered by S3 uploads to start ECS video processing task
@@ -81,8 +204,38 @@ def lambda_handler(event, context):
         for record in event['Records']:
             bucket = record['s3']['bucket']['name']
             key = unquote_plus(record['s3']['object']['key'])
+            event_name = record.get('eventName', '')
+
+            logger.info(f"Processing file: s3://{bucket}/{key} ({event_name})")
+
+            # A rename in the editor moves a video by copying it to the new key
+            # (SCUA-Video-Editing src/utils/rename.ts). Treating that copy as a new
+            # upload would re-run the whole pipeline and overwrite the segment JSON
+            # the rename just moved, losing the user's manual edits. The bucket
+            # notification already excludes Copy; this also holds if that config
+            # drifts or a legacy ObjectCreated:* rule is still in place.
+            if event_name.startswith('ObjectCreated:Copy'):
+                logger.info(f"Skipping {key}: internal copy (rename), not a new upload")
+                skipped_files.append({'key': key, 'reason': 'Internal copy, not a new upload'})
+                continue
             
-            logger.info(f"Processing file: s3://{bucket}/{key}")
+            # Route: edit/*_trim_request.json → trim mode
+            if key.startswith('edit/') and key.endswith('_trim_request.json'):
+                logger.info(f"Trim request detected: {key}")
+                processed_files.append(launch_trim_task(bucket, key))
+                continue
+            
+            # Route: edit/*_segment_request.json → re-segmentation mode
+            if key.startswith('edit/') and key.endswith('_segment_request.json'):
+                logger.info(f"Segment request detected: {key}")
+                processed_files.append(launch_segment_task(bucket, key))
+                continue
+            
+            # Route: video/*.mp4 → segment detection mode
+            if not key.startswith('video/'):
+                logger.info(f"Skipping {key}: not a recognized trigger pattern")
+                skipped_files.append({'key': key, 'reason': 'Not a recognized trigger pattern'})
+                continue
             
             # Validate that this is a video file
             is_valid, reason, file_info = validate_video_file(bucket, key)
@@ -96,18 +249,7 @@ def lambda_handler(event, context):
                 continue
             
             logger.info(f"Valid video file detected: {key} ({file_info['size']} bytes, {file_info['content_type']})")
-            
-            # Extract custom prompt from metadata
-            metadata = file_info['metadata']
-            custom_prompt = metadata.get('prompt')
-            
-            if custom_prompt:
-                logger.info(f"Using custom prompt from metadata: {custom_prompt}")
-            else:
-                # Use default prompt if no metadata provided
-                custom_prompt = os.environ.get('EVENT_PROMPT', '<image> Is there a person in the air jumping into the water?')
-                logger.info(f"Using default prompt: {custom_prompt}")
-            
+
             # Get environment variables
             cluster = os.environ['CLUSTER_NAME']
             task_definition = os.environ['TASK_DEFINITION']
@@ -146,10 +288,6 @@ def lambda_handler(event, context):
                                 {
                                     'name': 'S3_KEY',
                                     'value': key
-                                },
-                                {
-                                    'name': 'EVENT_PROMPT',
-                                    'value': custom_prompt
                                 }
                             ]
                         }
@@ -185,8 +323,7 @@ def lambda_handler(event, context):
             processed_files.append({
                 'key': key,
                 'task_arn': task_arn,
-                'file_size': file_info['size'],
-                'prompt': custom_prompt
+                'file_size': file_info['size']
             })
         
         # Prepare response

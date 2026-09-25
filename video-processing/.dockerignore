@@ -1,0 +1,16 @@
+# Keep the Docker build context small — none of this belongs in the image.
+.venv/
+output/
+test_videos/
+sample_work/
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+hf_cache/
+
+# Local dev pipeline outputs — the container regenerates these per video.
+asr_*.json
+transcript_*.json
+shots_fused_*.json
+segments*.json
