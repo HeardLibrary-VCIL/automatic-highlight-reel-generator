@@ -9,6 +9,7 @@ import * as autoscaling from 'aws-cdk-lib/aws-autoscaling';
 import * as kms from 'aws-cdk-lib/aws-kms';
 import { Platform } from 'aws-cdk-lib/aws-ecr-assets';
 import { Construct } from 'constructs';
+import { createHash } from 'crypto';
 
 export interface HighlightProcessorStackProps extends cdk.StackProps {
   /**
@@ -530,11 +531,10 @@ export class HighlightProcessorStack extends cdk.Stack {
     });
 
     // Custom resource to add notification to the existing Amplify bucket
-    const notificationHandler = new lambda.Function(this, 'S3NotificationHandler', {
-      runtime: lambda.Runtime.PYTHON_3_12,
-      handler: 'index.handler',
-      timeout: cdk.Duration.minutes(2),
-      code: lambda.Code.fromInline(`
+    // Held in a variable so the custom resource below can hash it: CloudFormation
+    // re-invokes a custom resource only when its PROPERTIES change, so editing this
+    // handler updated the Lambda but left the bucket on its previous configuration.
+    const notificationHandlerSource = `
 import boto3
 import cfnresponse
 import json
@@ -564,10 +564,17 @@ def handler(event, context):
                               if c.get('LambdaFunctionArn') != lambda_arn and c.get('Id') not in our_ids]
 
             # video/ uploads -> segment detection.
+            # Real uploads only, NOT ObjectCreated:Copy. The editor renames a video
+            # by copying it to the new key (SCUA-Video-Editing src/utils/rename.ts),
+            # and on 'Copy' this rule would re-run the whole pipeline over the
+            # renamed object -- burning Bedrock quota and overwriting the segment
+            # JSON the rename just moved, destroying the user's manual edits.
             lambda_configs.append({
                 'Id': notification_id,
                 'LambdaFunctionArn': lambda_arn,
-                'Events': ['s3:ObjectCreated:*'],
+                'Events': ['s3:ObjectCreated:Put',
+                           's3:ObjectCreated:Post',
+                           's3:ObjectCreated:CompleteMultipartUpload'],
                 'Filter': {
                     'Key': {
                         'FilterRules': [
@@ -630,7 +637,13 @@ def handler(event, context):
     except Exception as e:
         print(f"Error: {e}")
         cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, STABLE_ID)
-`),
+`;
+
+    const notificationHandler = new lambda.Function(this, 'S3NotificationHandler', {
+      runtime: lambda.Runtime.PYTHON_3_12,
+      handler: 'index.handler',
+      timeout: cdk.Duration.minutes(2),
+      code: lambda.Code.fromInline(notificationHandlerSource),
     });
 
     // The notification handler must manage the CURRENT bucket, but on a BucketName
@@ -653,9 +666,16 @@ def handler(event, context):
       properties: {
         BucketName: amplifyBucketName.valueAsString,
         LambdaArn: triggerLambda.functionArn,
+
         // Stack-name-scoped so distinct stacks never overwrite each other's
         // notification entries even if pointed at the same bucket.
         NotificationId: `scua-video-trim-trigger-${this.stackName}`,
+
+        // Changes whenever the handler above does, which is what makes
+        // CloudFormation actually re-run it. Without this, a change to the
+        // notification rules deploys cleanly and has no effect on the bucket.
+        HandlerVersion: createHash('sha256').update(notificationHandlerSource).digest('hex').slice(0, 16),
+
       },
     });
 
