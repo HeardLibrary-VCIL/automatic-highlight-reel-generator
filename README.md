@@ -150,7 +150,7 @@ cd automatic-highlight-reel-generator
 npm install
 npx cdk deploy HighlightProcessorStack \
   --parameters AmplifyBucketName=<prod-amplify-bucket-name> \
-  --profile scua-vcil
+  --profile <YOUR_PROFILE_NAME>
 ```
 
 Find the bucket name in `amplify_outputs.json` → `storage.bucket_name` in the SCUA-Video-Editing project.
@@ -175,14 +175,14 @@ cd automatic-highlight-reel-generator
 npm install
 
 # Confirm your AWS profile works and note the account id.
-aws sts get-caller-identity --profile scua-vcil
+aws sts get-caller-identity --profile <YOUR_PROFILE_NAME>
 ```
 
 If the account/region has never been used with CDK, bootstrap it once (safe to
 re-run; it's a no-op if already done):
 
 ```bash
-npx cdk bootstrap --profile scua-vcil
+npx cdk bootstrap --profile <YOUR_PROFILE_NAME>
 ```
 
 ### 2. Find your Amplify bucket name
@@ -202,7 +202,7 @@ resource, so your deployment is fully isolated from your classmates':
 npx cdk deploy HighlightProcessorDevStack-jane \
   -c devSuffix=jane \
   --parameters AmplifyBucketName=<your-amplify-bucket-name> \
-  --profile scua-vcil
+  --profile <YOUR_PROFILE_NAME>
 ```
 
 Use the same suffix for the stack name argument and the `devSuffix` context value.
@@ -222,14 +222,14 @@ Pick something unique (your name/VUnetID). With this suffix, your resources are:
 # The stack should show CREATE_COMPLETE / UPDATE_COMPLETE
 aws cloudformation describe-stacks \
   --stack-name HighlightProcessorDevStack-jane \
-  --query 'Stacks[0].StackStatus' --profile scua-vcil
+  --query 'Stacks[0].StackStatus' --profile s<YOUR_PROFILE_NAME>
 
 # Upload a test video to trigger the pipeline
-aws s3 cp test.mp4 s3://<your-amplify-bucket-name>/video/test.mp4 --profile scua-vcil
+aws s3 cp test.mp4 s3://<your-amplify-bucket-name>/video/test.mp4 --profile <YOUR_PROFILE_NAME>
 
 # Watch the task logs (name uses YOUR stack name)
 aws logs tail /ecs/scua-video-processor-HighlightProcessorDevStack-jane \
-  --follow --profile scua-vcil
+  --follow --profile <YOUR_PROFILE_NAME>
 ```
 
 ### 5. Tear it down when you're done
@@ -237,7 +237,7 @@ aws logs tail /ecs/scua-video-processor-HighlightProcessorDevStack-jane \
 Fargate has no idle cost, but clean up to keep the account tidy:
 
 ```bash
-npx cdk destroy HighlightProcessorDevStack-jane -c devSuffix=jane --profile scua-vcil
+npx cdk destroy HighlightProcessorDevStack-jane -c devSuffix=jane --profile <YOUR_PROFILE_NAME>
 ```
 
 > Pass the same `-c devSuffix=jane` you deployed with, so CDK resolves the same

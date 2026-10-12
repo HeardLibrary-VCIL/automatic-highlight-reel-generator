@@ -87,3 +87,4 @@ model-testing/test_frames.tar.gz
 
 *.mp4
 /test/video/*
+/DEPLOY_SCUA_INTEGRATION.md
