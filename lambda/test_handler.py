@@ -77,6 +77,39 @@ class RoutingTest(unittest.TestCase):
         handler.lambda_handler(s3_event("segment/RCC_183.json", "ObjectCreated:Put"), None)
         self.run_task.assert_not_called()
 
+    def test_an_audio_upload_starts_segmentation(self):
+        # Audio rides the same video/ prefix and ECS task; the task itself sees
+        # there is no video stream and runs the audio pipeline.
+        handler.lambda_handler(s3_event("video/Fisk_1971_sideA.wav", "ObjectCreated:Put"), None)
+        self.assertEqual(self.run_task.call_count, 1)
+
+
+class ValidationTest(unittest.TestCase):
+    def head(self, size, content_type):
+        return patch.object(handler.s3, "head_object",
+                            return_value={"ContentLength": size, "ContentType": content_type})
+
+    def test_audio_extensions_are_accepted(self):
+        for key in ("video/a.wav", "video/a.MP3", "video/a.flac", "video/a.m4a", "video/a.aiff"):
+            with self.head(5_000_000, "audio/x-wav"):
+                ok, reason, _ = handler.validate_video_file("b", key)
+            self.assertTrue(ok, f"{key}: {reason}")
+            self.assertEqual(reason, "Valid audio file")
+
+    def test_short_audio_clip_is_not_rejected_by_the_video_size_floor(self):
+        with self.head(500_000, "audio/mpeg"):            # ~30 s mp3
+            ok, _, _ = handler.validate_video_file("b", "video/clip.mp3")
+        self.assertTrue(ok)
+        with self.head(500_000, "video/mp4"):             # same size video: too small
+            ok, _, _ = handler.validate_video_file("b", "video/clip.mp4")
+        self.assertFalse(ok)
+
+    def test_unknown_extension_still_rejected(self):
+        with self.head(5_000_000, "application/pdf"):
+            ok, reason, _ = handler.validate_video_file("b", "video/notes.pdf")
+        self.assertFalse(ok)
+        self.assertIn(".wav", reason)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,6 +20,10 @@ Pipeline stages:
                           segment across camera cuts; score each boundary's confidence
   3. Write combined segment JSON to S3 for the Editor UI
 
+Audio-only uploads (no real video stream) are handed to ../audio-processing
+(audio_pipeline.run_audio_detect): Transcribe -> DSP segmenter (songs / speech /
+applause / dead space) -> Claude names each song -> the same segment JSON shape.
+
 All model calls go through Amazon Bedrock using the ECS task role, so no
 ANTHROPIC_API_KEY is needed anywhere in the deployed stack.
 
@@ -43,6 +47,14 @@ import boto3
 from botocore.exceptions import ClientError
 
 from analyze_deadspace import analyze, analyze_full_video, apply_trim
+
+# Audio-only files are handled by the sibling audio-processing/ folder. In the
+# image it is copied to /app/audio-processing (see Dockerfile); in a local checkout
+# it sits next to video-processing/. Put whichever exists on the import path.
+_HERE = Path(__file__).resolve().parent
+for _audio_dir in (_HERE / "audio-processing", _HERE.parent / "audio-processing"):
+    if _audio_dir.is_dir() and str(_audio_dir) not in sys.path:
+        sys.path.append(str(_audio_dir))
 
 # --- Configuration ---
 logging.basicConfig(
@@ -76,6 +88,9 @@ BLACK_PIC_TH = float(os.environ.get("BLACK_PIC_TH", "0.995"))
 MAX_FRAME_WIDTH = int(os.environ.get("MAX_FRAME_WIDTH", "768"))
 # Set FULL_VIDEO_SCAN=on to detect dead space throughout (not just head/tail)
 FULL_VIDEO_SCAN = os.environ.get("FULL_VIDEO_SCAN", "on").lower() in ("on", "true", "1")
+# Audio-only files go through ../audio-processing (songs / speech / dead space).
+# Set AUDIO_PIPELINE=off to send them down the video path instead (dead-space only).
+AUDIO_PIPELINE = os.environ.get("AUDIO_PIPELINE", "on").lower() in ("on", "true", "1")
 
 
 # Normalized content categories used as `segment_type` in the output. Claude's
@@ -965,6 +980,24 @@ def run_detect(s3_bucket, s3_key, pipeline_start_time):
             local_video_path = temp_dir / filename
             log.info(f"Downloading video to {local_video_path}...")
             s3_client.download_file(s3_bucket, s3_key, str(local_video_path))
+
+            # Audio-only upload (wav/mp3/flac/m4a/..., or any container with no real
+            # video stream): the visual detectors have nothing to look at, so it
+            # takes the audio pipeline instead — songs/speech/applause + dead space.
+            if AUDIO_PIPELINE:
+                from audio_pipeline import is_audio_only, run_audio_detect
+                if is_audio_only(str(local_video_path)):
+                    content_on = _should_run_content_segmentation()
+                    if content_on:
+                        from bedrock import make_client
+                    run_audio_detect(local_video_path, s3_client, s3_bucket, s3_key,
+                                     original_filename,
+                                     get_turns=get_transcript_turns if content_on else None,
+                                     make_client=make_client if content_on else None,
+                                     seg_key=segment_key(s3_key))
+                    log.info(f"=== SCUA Segment Detector (audio) Finished Successfully in "
+                             f"{time.time() - pipeline_start_time:.2f}s ===")
+                    return
 
             # --- STAGE 0: TRANSCRIBE FIRST (so speech can veto false dead space) ---
             # VHS audio is low-level and often reads as "silent" to ffmpeg's

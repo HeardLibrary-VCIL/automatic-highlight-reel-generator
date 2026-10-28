@@ -1,0 +1,6 @@
+# Audio pipeline (audio-processing/). Installed into the same image as
+# video-processing (see video-processing/Dockerfile); ffmpeg/ffprobe come from the OS.
+#   numpy    : signal processing in audio_segment.py (video-processing pins the exact version)
+#   pydantic : validates Claude's JSON in audio_label.py (also installed by anthropic)
+numpy>=1.24
+pydantic>=2.7,<3

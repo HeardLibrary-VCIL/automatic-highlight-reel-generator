@@ -131,15 +131,34 @@ SUPPORTED_VIDEO_EXTENSIONS = {
     '.m4v', '.3gp', '.ogv', '.ts', '.mts', '.m2ts'
 }
 
-# Minimum file size (in bytes) to consider as a valid video
+# Supported audio-only extensions. Uploaded under the same video/ prefix and
+# processed by the same ECS task, which detects the missing video stream and runs
+# the audio pipeline (video-processing/audio_segment.py). Keep in sync with
+# SUPPORTED_AUDIO_EXTENSIONS in SCUA-Video-Editing/src/utils/formats.ts.
+SUPPORTED_AUDIO_EXTENSIONS = {
+    '.wav', '.mp3', '.flac', '.m4a', '.aac', '.ogg', '.oga', '.opus',
+    '.aif', '.aiff', '.wma'
+}
+
+SUPPORTED_MEDIA_EXTENSIONS = SUPPORTED_VIDEO_EXTENSIONS | SUPPORTED_AUDIO_EXTENSIONS
+
+# Minimum file size (in bytes) to consider as a valid video. Audio is far
+# smaller per minute (a 30 s mp3 is ~0.5 MB), so it gets a lower floor.
 MIN_VIDEO_SIZE_BYTES = 1024 * 1024  # 1 MB
+MIN_AUDIO_SIZE_BYTES = 64 * 1024    # 64 KB
 
 def is_video_file(filename):
     """
-    Check if the file has a supported video extension
+    Check if the file has a supported media (video OR audio) extension.
+    (Name kept for existing callers; audio files ride the same pipeline.)
     """
     file_path = Path(filename.lower())
-    return file_path.suffix in SUPPORTED_VIDEO_EXTENSIONS
+    return file_path.suffix in SUPPORTED_MEDIA_EXTENSIONS
+
+
+def is_audio_file(filename):
+    """True for an audio-only extension (.wav, .mp3, ...)."""
+    return Path(filename.lower()).suffix in SUPPORTED_AUDIO_EXTENSIONS
 
 def validate_video_file(bucket, key):
     """
@@ -152,16 +171,17 @@ def validate_video_file(bucket, key):
         
         # Check file size
         file_size = response.get('ContentLength', 0)
-        if file_size < MIN_VIDEO_SIZE_BYTES:
-            return False, f"File too small ({file_size} bytes). Minimum size: {MIN_VIDEO_SIZE_BYTES} bytes", None
+        min_size = MIN_AUDIO_SIZE_BYTES if is_audio_file(key) else MIN_VIDEO_SIZE_BYTES
+        if file_size < min_size:
+            return False, f"File too small ({file_size} bytes). Minimum size: {min_size} bytes", None
         
         # Check file extension
         if not is_video_file(key):
-            return False, f"Unsupported file extension. Supported: {', '.join(sorted(SUPPORTED_VIDEO_EXTENSIONS))}", None
+            return False, f"Unsupported file extension. Supported: {', '.join(sorted(SUPPORTED_MEDIA_EXTENSIONS))}", None
         
         # Check content type if available
         content_type = response.get('ContentType', '').lower()
-        if content_type and not (content_type.startswith('video/') or content_type == 'application/octet-stream'):
+        if content_type and not (content_type.startswith(('video/', 'audio/')) or content_type == 'application/octet-stream'):
             logger.warning(f"Unexpected content type: {content_type}. Proceeding anyway based on file extension.")
         
         file_info = {
@@ -171,7 +191,7 @@ def validate_video_file(bucket, key):
             'metadata': response.get('Metadata', {})
         }
         
-        return True, "Valid video file", file_info
+        return True, ("Valid audio file" if is_audio_file(key) else "Valid video file"), file_info
         
     except Exception as e:
         return False, f"Error validating file: {str(e)}", None

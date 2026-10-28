@@ -1,0 +1,24 @@
+# Used by `docker build -f video-processing/Dockerfile .` (BuildKit reads the
+# <Dockerfile>.dockerignore next to the Dockerfile). The build context is the repo
+# root, so send ONLY the two pipeline folders. Keep in sync with the `exclude`
+# list on the container asset in lib/highlight-processor-stack.ts.
+*
+!video-processing
+!audio-processing
+
+**/__pycache__
+**/*.pyc
+**/.venv
+**/.DS_Store
+**/*.log
+**/hf_cache
+
+# Local dev outputs and samples — the container regenerates these per file.
+video-processing/output
+video-processing/test_videos
+video-processing/sample_work
+video-processing/asr_*.json
+video-processing/transcript_*.json
+video-processing/shots_fused_*.json
+video-processing/segments*.json
+audio-processing/samples

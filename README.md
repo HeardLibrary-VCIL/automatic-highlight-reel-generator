@@ -6,6 +6,7 @@ Automated dead-space detection and content labeling for archival video collectio
 |:--------|:------------|
 | [Overview](#overview) | What this system does and why |
 | [Pipeline](#pipeline) | The 4-stage processing pipeline |
+| [Audio Recordings](#audio-recordings) | Song / speech / dead-space segmentation for audio-only files |
 | [Architecture](#architecture) | AWS infrastructure and data flow |
 | [Deployment](#deployment) | How to deploy the backend |
 | [Configuration](#configuration) | Environment variables and tuning |
@@ -94,6 +95,36 @@ Writes `segment/{name}.json` to S3 :
 
 ---
 
+## Audio Recordings
+
+Audio-only uploads (`.wav .mp3 .flac .m4a .aac .ogg .oga .opus .aif .aiff .wma`, or any
+container with no real video stream; embedded cover art doesn't count) go to the same
+`video/` prefix, trigger the same Lambda and run in the same ECS task. All of the audio code
+lives in **[`audio-processing/`](audio-processing/README.md)**; `video-processing/main.py`
+only checks the file and hands audio to `audio_pipeline.run_audio_detect`:
+
+| Step | Where | What it does |
+|------|-------|--------------|
+| 1. Transcribe | `video-processing/main.get_transcript_turns` (passed in) | Same cached Amazon Transcribe call as video: what is said (and sung), with timestamps |
+| 2. Segment | `audio-processing/audio_segment.py` | numpy DSP on an ffmpeg PCM stream: one feature row per 0.5 s, classified as **song / speech / applause** or dead space (**silence / hiss / tone / static**); songs split at gaps, applause/speech, or novelty peaks |
+| 3. Label | `audio-processing/audio_label.py` | Claude (Bedrock) names each song from the announcements around it and its lyrics; pydantic-validated, one corrective retry |
+| 4. Write | `audio-processing/audio_pipeline.py` | `segment/{id}.json` in the same shape as video, plus `media_type: "audio"`, `song_count`, per-segment `song_number`, `title_confidence`, `title_evidence` |
+
+The image is built from the **repo root** (`docker build -f video-processing/Dockerfile .`)
+so it can include both folders: `video-processing/` → `/app`, `audio-processing/` →
+`/app/audio-processing`. CDK does the same, with an `exclude` list that sends only those two
+folders to the build (keep it in sync with `video-processing/Dockerfile.dockerignore`).
+
+Measured on a labelled test tape built from public clips: 98.5% of time correctly labelled
+and 12/12 boundaries within ±2 s with no false cuts (with Transcribe's speech spans); ~18 s
+and ~60 MB RAM for a 70-minute file. How it works, tests, evaluation tools and the
+`AUDIO_*` tuning variables: [`audio-processing/README.md`](audio-processing/README.md).
+
+Trim works unchanged: the trim task re-encodes kept spans to AAC in an `.mp4` container
+(audio-only, plays in the Editor).
+
+---
+
 ## Architecture
 
 ```
@@ -126,7 +157,7 @@ Infrastructure (CDK):
 1. AWS account with CDK bootstrapped
 2. AWS CLI configured with a profile (e.g., `scua-vcil`)
 3. Node.js 18+ and npm
-4. Docker running locally (for building the ECS container image)
+4. Docker running locally (for building the ECS container image; CDK builds it from the repo root so it includes `video-processing/` and `audio-processing/`)
 5. Claude Sonnet 4.6 enabled in Amazon Bedrock (Console → Bedrock → Model access)
 
 ### Two stacks
@@ -294,6 +325,7 @@ Environment variables set on the ECS container (configurable in the CDK stack):
 | `MAX_SPEAKERS` | `10` | Max speakers for diarization |
 | `MAX_FRAME_WIDTH` | `768` | Downscale frames to this width before sending to Claude |
 | `CLAUDE_MODEL` | `us.anthropic.claude-sonnet-4-6` | Bedrock model ID for content labeling |
+| `AUDIO_PIPELINE` | `on` | Audio-only files go to `audio-processing/`; `off` = treat like video. Other `AUDIO_*` knobs: see [`audio-processing/README.md`](audio-processing/README.md) |
 
 ---
 
@@ -303,7 +335,7 @@ All paths are within the Amplify-managed bucket:
 
 | Prefix | Contents | Written by |
 |--------|----------|------------|
-| `video/` | Source video uploads (.mp4) | Frontend (user upload) |
+| `video/` | Source uploads: video, and audio-only files (.wav/.mp3/...) | Frontend (user upload) |
 | `segment/{id}.json` | Segment timeline JSON | Backend (ECS) |
 | `transcript/{id}.json` | Word-level speaker turns (cached) | Backend (ECS) |
 | `transcript/{id}.vtt` | WebVTT for Aviary | Backend (ECS) |

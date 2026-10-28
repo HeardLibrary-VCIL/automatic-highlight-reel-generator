@@ -427,8 +427,33 @@ export class HighlightProcessorStack extends cdk.Stack {
         });
 
     taskDefinition.addContainer('video-processor', {
-      image: ecs.ContainerImage.fromAsset('./video-processing', {
-        platform: Platform.LINUX_AMD64
+      // Build context = the repo root, so the image holds both video-processing/
+      // (the entry point) and audio-processing/ (audio-only files). `exclude` uses
+      // Docker ignore syntax to send ONLY those two folders to the build; keep it in
+      // sync with video-processing/Dockerfile.dockerignore (used by local builds).
+      image: ecs.ContainerImage.fromAsset('.', {
+        file: 'video-processing/Dockerfile',
+        platform: Platform.LINUX_AMD64,
+        ignoreMode: cdk.IgnoreMode.DOCKER,
+        exclude: [
+          '*',
+          '!video-processing',
+          '!audio-processing',
+          '**/__pycache__',
+          '**/*.pyc',
+          '**/.venv',
+          '**/.DS_Store',
+          '**/*.log',
+          '**/hf_cache',
+          'video-processing/output',
+          'video-processing/test_videos',
+          'video-processing/sample_work',
+          'video-processing/asr_*.json',
+          'video-processing/transcript_*.json',
+          'video-processing/shots_fused_*.json',
+          'video-processing/segments*.json',
+          'audio-processing/samples',
+        ],
       }),
       // On Fargate the task-level cpu/mem govern; on EC2 these container limits do.
       // Reserve ~7GB on EC2 (leave headroom under the 8GiB instance); on Fargate the
